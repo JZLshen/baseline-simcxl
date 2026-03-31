@@ -20,15 +20,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 DISK_IMAGE="${1:-}"
-SOURCE="${REPO_ROOT}/tools/hydrarpc_multiclient_dedicated_coherent_send1_poll1.c"
+SOURCE="${REPO_ROOT}/tools/hydrarpc_multiclient_dedicated_coherent.c"
 BUILD_DIR="${REPO_ROOT}/output/hydrarpc_multiclient_dedicated_coherent_guest"
-BINARY_NAME="hydrarpc_multiclient_dedicated_coherent_send1_poll1"
+BINARY_NAME="hydrarpc_multiclient_dedicated_coherent"
 HOST_BINARY="${BUILD_DIR}/${BINARY_NAME}"
 GEM5_INCLUDE_DIR="${REPO_ROOT}/include"
 M5OPS_SOURCE="${REPO_ROOT}/util/m5/src/abi/x86/m5op.S"
 GUEST_DEST_DIR="/home/test_code"
 GUEST_BINARY="${GUEST_DEST_DIR}/${BINARY_NAME}"
 GUEST_WRAPPER="${GUEST_DEST_DIR}/run_${BINARY_NAME}.sh"
+LEGACY_GUEST_BINARY="${GUEST_DEST_DIR}/hydrarpc_multiclient_dedicated_coherent_send1_poll1"
+LEGACY_GUEST_WRAPPER="${GUEST_DEST_DIR}/run_hydrarpc_multiclient_dedicated_coherent_send1_poll1.sh"
 LEGACY_GUEST_WORKDIR="/root/hydrarpc"
 ROOT_BASHRC="/root/.bashrc"
 CC_BIN="${CC:-gcc}"
@@ -60,6 +62,8 @@ cleanup_legacy_dedicated_guest_artifacts() {
   local mounted_workdir="${MOUNT_POINT}${LEGACY_GUEST_WORKDIR}"
 
   sudo rm -f \
+    "${MOUNT_POINT}${LEGACY_GUEST_BINARY}" \
+    "${MOUNT_POINT}${LEGACY_GUEST_WRAPPER}" \
     "${mounted_workdir}/hydrarpc_autorun.env" \
     "${mounted_workdir}/hydrarpc_multiclient_dedicated_bootstrap.sh" \
     "${mounted_workdir}/hydrarpc_multiclient_dedicated_guest_runner.sh" \
@@ -145,7 +149,7 @@ WRAPPER_TMP="$(mktemp)"
 cat > "${WRAPPER_TMP}" <<'EOF'
 #!/bin/sh
 set -eu
-exec numactl -N 0 -m 0 /home/test_code/hydrarpc_multiclient_dedicated_coherent_send1_poll1 "$@"
+exec numactl -N 0 -m 0 /home/test_code/hydrarpc_multiclient_dedicated_coherent "$@"
 EOF
 sudo install -m 0755 "${WRAPPER_TMP}" "${MOUNT_POINT}${GUEST_WRAPPER}"
 rm -f "${WRAPPER_TMP}"

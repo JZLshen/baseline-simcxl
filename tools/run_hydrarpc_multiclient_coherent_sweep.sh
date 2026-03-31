@@ -8,13 +8,23 @@ Usage:
 
 Options:
   --root-outdir <dir>      Root output directory.
-  --count-per-client <N>   Requests per client. Default: 20
+  --count-per-client <N>   Requests per client. Default: 30
   --client-counts <list>   Quoted list, e.g. "1 2 4 8 16 32"
+  --slot-count <N>         Ring depth passed to the coherent dedicated runner. Default: 1024
+  --req-bytes <N>          Request payload bytes. Default: 64
+  --resp-bytes <N>         Response payload bytes. Default: 64
   --cpu-type <type>        Switch CPU type passed to the runner. Default: TIMING
   --boot-cpu <type>        Boot CPU type passed to the runner. Default: KVM
+  --slow-client-count <N>  Mark the first N client ids as slow. Default: 0
+  --slow-count-per-client <N>
+                           Request count used by each slow client.
+  --slow-send-gap-ns <N>   Uniform inter-request gap used by slow clients. Default: 0
   --send-mode <mode>       Client pacing mode: greedy, uniform, staggered, or uneven. Default: greedy
   --send-gap-ns <N>        Inter-request gap used by all paced modes. Default: 0
-  --record-breakdown <m>   Instrumentation level: none or basic. Default: none
+  --request-transfer-mode <mode>
+                           Request publish mode: staging or direct. Default: staging
+  --response-transfer-mode <mode>
+                           Response publish mode: staging or direct. Default: staging
   --num-cpus <N>           Guest CPU count passed to the runner. Default: auto
   --guest-cflags <flags>   Host gcc flags used for the injected guest binary.
   --skip-image-setup       Reuse the coherent dedicated guest binary already injected into the disk image.
@@ -26,13 +36,20 @@ EOF
 }
 
 ROOT_OUTDIR=""
-COUNT_PER_CLIENT=20
+COUNT_PER_CLIENT=30
 CLIENT_COUNTS="1 2 4 8 16 32"
+SLOT_COUNT=1024
+REQ_BYTES=64
+RESP_BYTES=64
 CPU_TYPE="TIMING"
 BOOT_CPU="KVM"
+SLOW_CLIENT_COUNT=0
+SLOW_COUNT_PER_CLIENT=0
+SLOW_SEND_GAP_NS=0
 SEND_MODE="greedy"
 SEND_GAP_NS=0
-RECORD_BREAKDOWN="none"
+REQUEST_TRANSFER_MODE="staging"
+RESPONSE_TRANSFER_MODE="staging"
 NUM_CPUS=0
 GUEST_CFLAGS=""
 SKIP_IMAGE_SETUP=0
@@ -55,12 +72,36 @@ while [[ $# -gt 0 ]]; do
       CLIENT_COUNTS="$2"
       shift 2
       ;;
+    --slot-count)
+      SLOT_COUNT="$2"
+      shift 2
+      ;;
+    --req-bytes)
+      REQ_BYTES="$2"
+      shift 2
+      ;;
+    --resp-bytes)
+      RESP_BYTES="$2"
+      shift 2
+      ;;
     --cpu-type)
       CPU_TYPE="$2"
       shift 2
       ;;
     --boot-cpu)
       BOOT_CPU="$2"
+      shift 2
+      ;;
+    --slow-client-count)
+      SLOW_CLIENT_COUNT="$2"
+      shift 2
+      ;;
+    --slow-count-per-client)
+      SLOW_COUNT_PER_CLIENT="$2"
+      shift 2
+      ;;
+    --slow-send-gap-ns)
+      SLOW_SEND_GAP_NS="$2"
       shift 2
       ;;
     --send-mode)
@@ -71,8 +112,12 @@ while [[ $# -gt 0 ]]; do
       SEND_GAP_NS="$2"
       shift 2
       ;;
-    --record-breakdown)
-      RECORD_BREAKDOWN="$2"
+    --request-transfer-mode)
+      REQUEST_TRANSFER_MODE="$2"
+      shift 2
+      ;;
+    --response-transfer-mode)
+      RESPONSE_TRANSFER_MODE="$2"
       shift 2
       ;;
     --num-cpus)
@@ -163,7 +208,7 @@ record_failure() {
 
 resolve_log_path() {
   local outdir="$1"
-  local result_log="$outdir/hydrarpc_multiclient_dedicated_coherent_send1_poll1.result.log"
+  local result_log="$outdir/hydrarpc_multiclient_dedicated_coherent.result.log"
 
   if [[ -f "$result_log" ]]; then
     printf '%s\n' "$result_log"
@@ -180,9 +225,14 @@ resolve_log_path() {
 
 run_outdir() {
   local client_count="$1"
+  local slow_suffix=""
+
+  if [[ "$SLOW_CLIENT_COUNT" -gt 0 ]]; then
+    slow_suffix="_slow${SLOW_CLIENT_COUNT}_n${SLOW_COUNT_PER_CLIENT}_sg${SLOW_SEND_GAP_NS}"
+  fi
 
   printf '%s\n' \
-    "$ROOT_OUTDIR/coherent_m${SEND_MODE}_g${SEND_GAP_NS}_b${RECORD_BREAKDOWN}_c${client_count}_r${COUNT_PER_CLIENT}"
+    "$ROOT_OUTDIR/coherent_s${SLOT_COUNT}_qb${REQ_BYTES}_pb${RESP_BYTES}_req${REQUEST_TRANSFER_MODE}_resp${RESPONSE_TRANSFER_MODE}_m${SEND_MODE}_g${SEND_GAP_NS}${slow_suffix}_c${client_count}_r${COUNT_PER_CLIENT}"
 }
 
 is_transient_cpu_failure() {
@@ -191,7 +241,7 @@ is_transient_cpu_failure() {
   rg -q \
     "need online cpus > max\\(server-cpu, client-count-1\\)|failed to pin server to cpu|failed to pin client" \
     "$outdir/board.pc.com_1.device" \
-    "$outdir/hydrarpc_multiclient_dedicated_coherent_send1_poll1.result.log" \
+    "$outdir/hydrarpc_multiclient_dedicated_coherent.result.log" \
     2>/dev/null
 }
 
@@ -254,9 +304,14 @@ run_runner_only() {
     mkdir -p "$outdir"
     extra_args=(
       --skip-image-setup
+      --slot-count "$SLOT_COUNT"
+      --req-bytes "$REQ_BYTES"
+      --resp-bytes "$RESP_BYTES"
+      --slow-client-count "$SLOW_CLIENT_COUNT"
+      --slow-count-per-client "$SLOW_COUNT_PER_CLIENT"
+      --slow-send-gap-ns "$SLOW_SEND_GAP_NS"
       --send-mode "$SEND_MODE"
       --send-gap-ns "$SEND_GAP_NS"
-      --record-breakdown "$RECORD_BREAKDOWN"
     )
     if [[ "$NUM_CPUS" -gt 0 ]]; then
       extra_args+=(--num-cpus "$NUM_CPUS")
@@ -266,12 +321,14 @@ run_runner_only() {
     fi
 
     set +e
-    bash tools/run_e2e_hydrarpc_multiclient_dedicated_coherent_send1_poll1.sh \
+    bash tools/run_e2e_hydrarpc_multiclient_dedicated_coherent.sh \
       --skip-build \
       --cpu-type "$CPU_TYPE" \
       --boot-cpu "$BOOT_CPU" \
       --client-count "$client_count" \
       --count-per-client "$COUNT_PER_CLIENT" \
+      --request-transfer-mode "$REQUEST_TRANSFER_MODE" \
+      --response-transfer-mode "$RESPONSE_TRANSFER_MODE" \
       "${extra_args[@]}" \
       --outdir "$outdir" \
       >"$console_log" 2>&1
@@ -307,6 +364,7 @@ run_runner_only() {
 process_one() {
   local client_count="$1"
   local outdir=""
+  local expected_total_requests=0
   local log_path=""
   local summary_text=""
   local summary_rc=0
@@ -334,13 +392,19 @@ process_one() {
     return 0
   fi
 
+  expected_total_requests=$((client_count * COUNT_PER_CLIENT))
+  if [[ "$SLOW_CLIENT_COUNT" -gt 0 ]]; then
+    expected_total_requests=$((expected_total_requests - SLOW_CLIENT_COUNT * (COUNT_PER_CLIENT - SLOW_COUNT_PER_CLIENT)))
+  fi
+
   set +e
   summary_text="$(
     python3 tools/summarize_hydrarpc_multiclient.py \
       --log "$log_path" \
-      --experiment multiclient_dedicated_coherent_send1_poll1 \
+      --experiment multiclient_dedicated_coherent \
       --client-count "$client_count" \
       --count-per-client "$COUNT_PER_CLIENT" \
+      --expected-total-requests "$expected_total_requests" \
       --drop-first-per-client "$DROP_FIRST_PER_CLIENT" \
       --csv "$SUMMARY_CSV" \
       --steady-csv "$STEADY_CSV" \

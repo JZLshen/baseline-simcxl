@@ -34,6 +34,31 @@ def fmt_ns(value):
     return f"{value:.3f}"
 
 
+def request_rows_from_log(log_path: Path):
+    parsed = parse_log(log_path)
+    rows = []
+
+    for (client_id, req_id), entry in parsed["timing_by_request"].items():
+        start_ns = entry.get("client_req_start_ts_ns", 0)
+        end_ns = entry.get("client_resp_done_ts_ns", 0)
+
+        if start_ns == 0 or end_ns == 0:
+            continue
+
+        rows.append(
+            {
+                "client_id": client_id,
+                "req_id": req_id,
+                "start_ns": start_ns,
+                "end_ns": end_ns,
+                "latency_ns": end_ns - start_ns,
+            }
+        )
+
+    rows.sort(key=lambda row: (row["client_id"], row["req_id"]))
+    return rows
+
+
 def requests_per_client_profile(request_rows):
     counts = Counter()
     for row in request_rows:
@@ -51,6 +76,11 @@ def discover_series_log(root: Path, series: str, client_count: int):
         candidates = [
             root
             / f"c{client_count}"
+            / f"coherent_qb64_pb64_reqstaging_respstaging_mgreedy_g0_c{client_count}_r20"
+            / "board.pc.com_1.device",
+            root / f"coherent_qb64_pb64_reqstaging_respstaging_mgreedy_g0_c{client_count}_r20" / "board.pc.com_1.device",
+            root
+            / f"c{client_count}"
             / f"coherent_mgreedy_g0_bnone_c{client_count}_r20"
             / "board.pc.com_1.device",
             root / f"coherent_mgreedy_g0_bnone_c{client_count}_r20" / "board.pc.com_1.device",
@@ -58,6 +88,11 @@ def discover_series_log(root: Path, series: str, client_count: int):
         ]
     elif series == "noncoherent":
         candidates = [
+            root
+            / f"c{client_count}"
+            / f"dedicated_qb64_pb64_reqstaging_respstaging_mgreedy_g0_c{client_count}_r20"
+            / "board.pc.com_1.device",
+            root / f"dedicated_qb64_pb64_reqstaging_respstaging_mgreedy_g0_c{client_count}_r20" / "board.pc.com_1.device",
             root
             / f"c{client_count}"
             / f"dedicated_mgreedy_g0_bnone_c{client_count}_r20"
@@ -84,7 +119,7 @@ def build_row_from_log(
     slow_rate_pct,
     log_path: Path,
 ):
-    _, request_rows, _ = parse_log(log_path)
+    request_rows = request_rows_from_log(log_path)
     window = compute_window_stats(request_rows)
     row = {
         "dataset": dataset,

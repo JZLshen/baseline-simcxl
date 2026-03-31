@@ -8,14 +8,24 @@ Usage:
 
 Options:
   --root-outdir <dir>      Root output directory.
-  --count-per-client <N>   Requests per client. Default: 20
+  --count-per-client <N>   Requests per client. Default: 30
   --client-counts <list>   Quoted list, e.g. "1 2 4 8 16 32"
   --kinds <list>           Quoted list from "dedicated shared". Default: both
+  --slot-count <N>         Ring depth passed to both shared and dedicated. Default: 1024
+  --req-bytes <N>          Request payload bytes. Default: 64
+  --resp-bytes <N>         Response payload bytes. Default: 64
   --cpu-type <type>        Switch CPU type passed to runners. Default: TIMING
   --boot-cpu <type>        Boot CPU type passed to runners. Default: KVM
-  --send-mode <mode>       Dedicated client pacing mode: greedy, uniform, staggered, or uneven. Default: greedy
-  --send-gap-ns <N>        Dedicated inter-request gap used by all paced modes. Default: 0
-  --record-breakdown <m>   Dedicated instrumentation level: none or basic. Default: none
+  --slow-client-count <N>  Mark the first N client ids as slow. Default: 0
+  --slow-count-per-client <N>
+                           Request count used by each slow client.
+  --slow-send-gap-ns <N>   Uniform inter-request gap used by slow clients. Default: 0
+  --send-mode <mode>       Client pacing mode: greedy, uniform, staggered, or uneven. Default: greedy
+  --send-gap-ns <N>        Inter-request gap used by all paced modes. Default: 0
+  --request-transfer-mode <mode>
+                           Dedicated request publish mode: staging or direct. Default: staging
+  --response-transfer-mode <mode>
+                           Dedicated response publish mode: staging or direct. Default: staging
   --num-cpus <N>           Guest CPU count passed to runners. Default: auto
   --guest-cflags <flags>   Host gcc flags used for the injected guest binaries.
   --skip-image-setup       Reuse the shared/dedicated guest binaries already injected into the disk image.
@@ -28,14 +38,21 @@ EOF
 }
 
 ROOT_OUTDIR=""
-COUNT_PER_CLIENT=20
+COUNT_PER_CLIENT=30
 CLIENT_COUNTS="1 2 4 8 16 32"
 KINDS="dedicated shared"
+SLOT_COUNT=1024
+REQ_BYTES=64
+RESP_BYTES=64
 CPU_TYPE="TIMING"
 BOOT_CPU="KVM"
+SLOW_CLIENT_COUNT=0
+SLOW_COUNT_PER_CLIENT=0
+SLOW_SEND_GAP_NS=0
 SEND_MODE="greedy"
 SEND_GAP_NS=0
-RECORD_BREAKDOWN="none"
+REQUEST_TRANSFER_MODE="staging"
+RESPONSE_TRANSFER_MODE="staging"
 NUM_CPUS=0
 GUEST_CFLAGS=""
 SKIP_IMAGE_SETUP=0
@@ -63,12 +80,36 @@ while [[ $# -gt 0 ]]; do
       KINDS="$2"
       shift 2
       ;;
+    --slot-count)
+      SLOT_COUNT="$2"
+      shift 2
+      ;;
+    --req-bytes)
+      REQ_BYTES="$2"
+      shift 2
+      ;;
+    --resp-bytes)
+      RESP_BYTES="$2"
+      shift 2
+      ;;
     --cpu-type)
       CPU_TYPE="$2"
       shift 2
       ;;
     --boot-cpu)
       BOOT_CPU="$2"
+      shift 2
+      ;;
+    --slow-client-count)
+      SLOW_CLIENT_COUNT="$2"
+      shift 2
+      ;;
+    --slow-count-per-client)
+      SLOW_COUNT_PER_CLIENT="$2"
+      shift 2
+      ;;
+    --slow-send-gap-ns)
+      SLOW_SEND_GAP_NS="$2"
       shift 2
       ;;
     --send-mode)
@@ -79,8 +120,12 @@ while [[ $# -gt 0 ]]; do
       SEND_GAP_NS="$2"
       shift 2
       ;;
-    --record-breakdown)
-      RECORD_BREAKDOWN="$2"
+    --request-transfer-mode)
+      REQUEST_TRANSFER_MODE="$2"
+      shift 2
+      ;;
+    --response-transfer-mode)
+      RESPONSE_TRANSFER_MODE="$2"
       shift 2
       ;;
     --num-cpus)
@@ -190,10 +235,10 @@ resolve_log_path() {
 
   case "$kind" in
     dedicated)
-      result_log="$outdir/hydrarpc_multiclient_dedicated_send1_poll1.result.log"
+      result_log="$outdir/hydrarpc_multiclient_dedicated.result.log"
       ;;
     shared)
-      result_log="$outdir/hydrarpc_multiclient_shared_send1_poll1.result.log"
+      result_log="$outdir/hydrarpc_multiclient_shared.result.log"
       ;;
     *)
       return 1
@@ -216,14 +261,20 @@ resolve_log_path() {
 run_outdir() {
   local kind="$1"
   local client_count="$2"
+  local slow_suffix=""
+
+  if [[ "$SLOW_CLIENT_COUNT" -gt 0 ]]; then
+    slow_suffix="_slow${SLOW_CLIENT_COUNT}_n${SLOW_COUNT_PER_CLIENT}_sg${SLOW_SEND_GAP_NS}"
+  fi
 
   if [[ "$kind" == "dedicated" ]]; then
     printf '%s\n' \
-      "$ROOT_OUTDIR/${kind}_m${SEND_MODE}_g${SEND_GAP_NS}_b${RECORD_BREAKDOWN}_c${client_count}_r${COUNT_PER_CLIENT}"
+      "$ROOT_OUTDIR/${kind}_s${SLOT_COUNT}_qb${REQ_BYTES}_pb${RESP_BYTES}_req${REQUEST_TRANSFER_MODE}_resp${RESPONSE_TRANSFER_MODE}_m${SEND_MODE}_g${SEND_GAP_NS}${slow_suffix}_c${client_count}_r${COUNT_PER_CLIENT}"
     return 0
   fi
 
-  printf '%s\n' "$ROOT_OUTDIR/${kind}_c${client_count}_r${COUNT_PER_CLIENT}"
+  printf '%s\n' \
+    "$ROOT_OUTDIR/${kind}_s${SLOT_COUNT}_qb${REQ_BYTES}_pb${RESP_BYTES}_m${SEND_MODE}_g${SEND_GAP_NS}${slow_suffix}_c${client_count}_r${COUNT_PER_CLIENT}"
 }
 
 is_transient_cpu_failure() {
@@ -232,8 +283,8 @@ is_transient_cpu_failure() {
   rg -q \
     "need online cpus > max\\(server-cpu, client-count-1\\)|failed to pin server to cpu|failed to pin client" \
     "$outdir/board.pc.com_1.device" \
-    "$outdir/hydrarpc_multiclient_shared_send1_poll1.result.log" \
-    "$outdir/hydrarpc_multiclient_dedicated_send1_poll1.result.log" \
+    "$outdir/hydrarpc_multiclient_shared.result.log" \
+    "$outdir/hydrarpc_multiclient_dedicated.result.log" \
     2>/dev/null
 }
 
@@ -254,10 +305,10 @@ run_runner_only() {
   runner_rc_file="$outdir/runner.exitcode"
   case "$kind" in
     dedicated)
-      runner="tools/run_e2e_hydrarpc_multiclient_dedicated_send1_poll1.sh"
+      runner="tools/run_e2e_hydrarpc_multiclient_dedicated.sh"
       ;;
     shared)
-      runner="tools/run_e2e_hydrarpc_multiclient_shared_send1_poll1.sh"
+      runner="tools/run_e2e_hydrarpc_multiclient_shared.sh"
       ;;
     *)
       echo "unknown kind: $kind" >&2
@@ -285,15 +336,32 @@ run_runner_only() {
     if [[ "$kind" == "dedicated" ]]; then
       extra_args+=(
         --skip-image-setup
+        --slot-count "$SLOT_COUNT"
+        --req-bytes "$REQ_BYTES"
+        --resp-bytes "$RESP_BYTES"
+        --slow-client-count "$SLOW_CLIENT_COUNT"
+        --slow-count-per-client "$SLOW_COUNT_PER_CLIENT"
+        --slow-send-gap-ns "$SLOW_SEND_GAP_NS"
         --send-mode "$SEND_MODE"
         --send-gap-ns "$SEND_GAP_NS"
-        --record-breakdown "$RECORD_BREAKDOWN"
+        --request-transfer-mode "$REQUEST_TRANSFER_MODE"
+        --response-transfer-mode "$RESPONSE_TRANSFER_MODE"
       )
       if [[ -n "$GUEST_CFLAGS" ]]; then
         extra_args+=(--guest-cflags "$GUEST_CFLAGS")
       fi
     elif [[ "$kind" == "shared" ]]; then
-      extra_args+=(--skip-image-setup)
+      extra_args+=(
+        --skip-image-setup
+        --slot-count "$SLOT_COUNT"
+        --req-bytes "$REQ_BYTES"
+        --resp-bytes "$RESP_BYTES"
+        --slow-client-count "$SLOW_CLIENT_COUNT"
+        --slow-count-per-client "$SLOW_COUNT_PER_CLIENT"
+        --slow-send-gap-ns "$SLOW_SEND_GAP_NS"
+        --send-mode "$SEND_MODE"
+        --send-gap-ns "$SEND_GAP_NS"
+      )
       if [[ -n "$GUEST_CFLAGS" ]]; then
         extra_args+=(--guest-cflags "$GUEST_CFLAGS")
       fi
@@ -342,6 +410,7 @@ process_one() {
   local client_count="$2"
   local outdir=""
   local experiment=""
+  local expected_total_requests=0
   local log_path=""
   local summary_text=""
   local summary_rc=0
@@ -352,10 +421,10 @@ process_one() {
   runner_rc_file="$outdir/runner.exitcode"
   case "$kind" in
     dedicated)
-      experiment="multiclient_dedicated_send1_poll1"
+      experiment="multiclient_dedicated"
       ;;
     shared)
-      experiment="multiclient_shared_send1_poll1"
+      experiment="multiclient_shared"
       ;;
     *)
       echo "unknown kind: $kind" >&2
@@ -381,6 +450,11 @@ process_one() {
     return 0
   fi
 
+  expected_total_requests=$((client_count * COUNT_PER_CLIENT))
+  if [[ "$SLOW_CLIENT_COUNT" -gt 0 ]]; then
+    expected_total_requests=$((expected_total_requests - SLOW_CLIENT_COUNT * (COUNT_PER_CLIENT - SLOW_COUNT_PER_CLIENT)))
+  fi
+
   set +e
   summary_text="$(
     python3 tools/summarize_hydrarpc_multiclient.py \
@@ -388,6 +462,7 @@ process_one() {
       --experiment "$experiment" \
       --client-count "$client_count" \
       --count-per-client "$COUNT_PER_CLIENT" \
+      --expected-total-requests "$expected_total_requests" \
       --drop-first-per-client "$DROP_FIRST_PER_CLIENT" \
       --csv "$SUMMARY_CSV" \
       --steady-csv "$STEADY_CSV" \

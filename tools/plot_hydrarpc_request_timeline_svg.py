@@ -6,7 +6,10 @@ import re
 from pathlib import Path
 
 
-TIMING_PATTERN = re.compile(r"^client_(\d+)_req_(\d+)_(start_ns|end_ns)=(\d+)$")
+TIMING_PATTERN = re.compile(
+    r"^client_(\d+)_req_(\d+)_"
+    r"(client_req_start_ts_ns|client_resp_done_ts_ns|start_ns|end_ns)=(\d+)$"
+)
 
 
 def parse_log(log_path: Path):
@@ -26,7 +29,7 @@ def parse_log(log_path: Path):
             value = int(match.group(4))
             key = (client_id, req_id)
 
-            if kind == "start_ns":
+            if kind in ("start_ns", "client_req_start_ts_ns"):
                 starts[key] = value
             else:
                 ends[key] = value

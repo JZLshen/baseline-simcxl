@@ -12,12 +12,16 @@ Options:
   --cpu-type <type>             Switch CPU type. Default: TIMING
   --boot-cpu <type>             Boot CPU type before first m5 exit. Default: KVM
   --client-count <N>            Total client count. Default: 16
-  --count-per-client <N>        Normal-client request count. Default: 20
+  --count-per-client <N>        Normal-client request count. Default: 30
+  --slot-count <N>              Per-client ring depth. Default: 1024
+  --req-bytes <N>               Request payload bytes. Default: 64
+  --resp-bytes <N>              Response payload bytes. Default: 64
   --slow-count-per-client <N>   Request count for slow clients. Default: 2
   --slow-client-counts <list>   Quoted list, e.g. "1 2 4 8 16"
   --slow-send-gap-ns <N>        Uniform gap used by slow clients. Default: 20000
   --window-size <N>             Per-client window size. Default: 16
-  --slot-count <N>              Per-client ring depth. Default: min(window-size, count-per-client)
+  --request-transfer-mode <m>   Dedicated request publish mode: staging or direct. Default: staging
+  --response-transfer-mode <m>  Dedicated response publish mode: staging or direct. Default: staging
   --cxl-node <N>                NUMA node used for CXL mappings. Default: 1
   --num-cpus <N>                Guest CPU count. Default: client-count + 2
   --server-cpu <N>              Server CPU id. Default: client-count
@@ -34,7 +38,7 @@ Behavior:
   - Slow clients issue only slow-count-per-client requests and use uniform
     pacing with slow-send-gap-ns.
   - Normal clients remain on the default greedy dedicated path.
-  - Guest instrumentation stays at start/end only (record-breakdown=none).
+  - Guest raw output records only the minimal per-request timestamps.
 EOF
 }
 
@@ -46,12 +50,16 @@ BINARY="build/X86/gem5.opt"
 CPU_TYPE="TIMING"
 BOOT_CPU="KVM"
 CLIENT_COUNT=16
-COUNT_PER_CLIENT=20
-SLOW_COUNT_PER_CLIENT=2
+COUNT_PER_CLIENT=30
+SLOT_COUNT=1024
+REQ_BYTES=64
+RESP_BYTES=64
+SLOW_COUNT_PER_CLIENT=8
 SLOW_CLIENT_COUNTS="1 2 4 8 16"
 SLOW_SEND_GAP_NS=20000
 WINDOW_SIZE=16
-SLOT_COUNT=0
+REQUEST_TRANSFER_MODE="staging"
+RESPONSE_TRANSFER_MODE="staging"
 CXL_NODE=1
 NUM_CPUS=0
 SERVER_CPU=-1
@@ -87,6 +95,18 @@ while [[ $# -gt 0 ]]; do
       COUNT_PER_CLIENT="$2"
       shift 2
       ;;
+    --slot-count)
+      SLOT_COUNT="$2"
+      shift 2
+      ;;
+    --req-bytes)
+      REQ_BYTES="$2"
+      shift 2
+      ;;
+    --resp-bytes)
+      RESP_BYTES="$2"
+      shift 2
+      ;;
     --slow-count-per-client)
       SLOW_COUNT_PER_CLIENT="$2"
       shift 2
@@ -105,6 +125,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --slot-count)
       SLOT_COUNT="$2"
+      shift 2
+      ;;
+    --request-transfer-mode)
+      REQUEST_TRANSFER_MODE="$2"
+      shift 2
+      ;;
+    --response-transfer-mode)
+      RESPONSE_TRANSFER_MODE="$2"
       shift 2
       ;;
     --cxl-node)
@@ -188,12 +216,15 @@ PY
   echo "[$(date '+%F %T')] START slow_client_count=${slow_client_count} outdir=${out}" | tee -a "$RUNLOG"
 
   set +e
-  bash "$REPO_ROOT/tools/run_e2e_hydrarpc_multiclient_dedicated_send1_poll1.sh" \
+  bash "$REPO_ROOT/tools/run_e2e_hydrarpc_multiclient_dedicated.sh" \
     --binary "$BINARY" \
     --cpu-type "$CPU_TYPE" \
     --boot-cpu "$BOOT_CPU" \
     --client-count "$CLIENT_COUNT" \
     --count-per-client "$COUNT_PER_CLIENT" \
+    --slot-count "$SLOT_COUNT" \
+    --req-bytes "$REQ_BYTES" \
+    --resp-bytes "$RESP_BYTES" \
     --window-size "$WINDOW_SIZE" \
     --slot-count "$SLOT_COUNT" \
     --slow-client-count "$slow_client_count" \
@@ -201,7 +232,8 @@ PY
     --slow-send-gap-ns "$SLOW_SEND_GAP_NS" \
     --send-mode greedy \
     --send-gap-ns 0 \
-    --record-breakdown none \
+    --request-transfer-mode "$REQUEST_TRANSFER_MODE" \
+    --response-transfer-mode "$RESPONSE_TRANSFER_MODE" \
     --cxl-node "$CXL_NODE" \
     --num-cpus "$NUM_CPUS" \
     --server-cpu "$SERVER_CPU" \
@@ -213,7 +245,7 @@ PY
 
   python3 "$REPO_ROOT/tools/summarize_hydrarpc_multiclient.py" \
     --log "$out/board.pc.com_1.device" \
-    --experiment multiclient_dedicated_send1_poll1_slowmix \
+    --experiment multiclient_dedicated_slowmix \
     --client-count "$CLIENT_COUNT" \
     --count-per-client "$COUNT_PER_CLIENT" \
     --expected-total-requests "$expected_total" \
@@ -262,8 +294,18 @@ summary_fieldnames = [
     "total_e2e_ns",
     "avg_latency_ns",
     "median_latency_ns",
+    "p50_latency_ns",
+    "p99_latency_ns",
     "aggregate_throughput_mrps",
-    "correctness_fail_count",
+    "avg_server_poll_notify_ns",
+    "p50_server_poll_notify_ns",
+    "p99_server_poll_notify_ns",
+    "avg_server_execute_ns",
+    "p50_server_execute_ns",
+    "p99_server_execute_ns",
+    "avg_server_response_ns",
+    "p50_server_response_ns",
+    "p99_server_response_ns",
     "outdir",
     "log_path",
 ]
@@ -280,11 +322,23 @@ steady_fieldnames = [
     "steady_avg_latency_ns",
     "steady_median_latency_ns",
     "steady_avg_reqresp_latency_ns",
+    "steady_p50_latency_ns",
+    "steady_p99_latency_ns",
     "steady_avg_gap_ns",
     "steady_median_gap_ns",
+    "steady_p99_gap_ns",
     "steady_avg_throughput_mrps",
     "steady_avg_gap_throughput_mrps",
     "steady_median_throughput_mrps",
+    "steady_avg_server_poll_notify_ns",
+    "steady_p50_server_poll_notify_ns",
+    "steady_p99_server_poll_notify_ns",
+    "steady_avg_server_execute_ns",
+    "steady_p50_server_execute_ns",
+    "steady_p99_server_execute_ns",
+    "steady_avg_server_response_ns",
+    "steady_p50_server_response_ns",
+    "steady_p99_server_response_ns",
     "first_kept_end_ns",
     "last_kept_end_ns",
     "outdir",
@@ -319,8 +373,54 @@ for result_path in sorted(outdir.glob("slow*/result.json")):
             "total_e2e_ns": stats["total_e2e_ns"],
             "avg_latency_ns": f"{stats['avg_latency_ns']:.3f}",
             "median_latency_ns": f"{stats['median_latency_ns']:.3f}",
+            "p50_latency_ns": f"{stats['p50_latency_ns']:.3f}",
+            "p99_latency_ns": f"{stats['p99_latency_ns']:.3f}",
             "aggregate_throughput_mrps": f"{stats['aggregate_throughput_mrps']:.6f}",
-            "correctness_fail_count": stats["correctness_fail_count"],
+            "avg_server_poll_notify_ns": (
+                f"{stats['avg_server_poll_notify_ns']:.3f}"
+                if stats.get("avg_server_poll_notify_ns") is not None
+                else ""
+            ),
+            "p50_server_poll_notify_ns": (
+                f"{stats['p50_server_poll_notify_ns']:.3f}"
+                if stats.get("p50_server_poll_notify_ns") is not None
+                else ""
+            ),
+            "p99_server_poll_notify_ns": (
+                f"{stats['p99_server_poll_notify_ns']:.3f}"
+                if stats.get("p99_server_poll_notify_ns") is not None
+                else ""
+            ),
+            "avg_server_execute_ns": (
+                f"{stats['avg_server_execute_ns']:.3f}"
+                if stats.get("avg_server_execute_ns") is not None
+                else ""
+            ),
+            "p50_server_execute_ns": (
+                f"{stats['p50_server_execute_ns']:.3f}"
+                if stats.get("p50_server_execute_ns") is not None
+                else ""
+            ),
+            "p99_server_execute_ns": (
+                f"{stats['p99_server_execute_ns']:.3f}"
+                if stats.get("p99_server_execute_ns") is not None
+                else ""
+            ),
+            "avg_server_response_ns": (
+                f"{stats['avg_server_response_ns']:.3f}"
+                if stats.get("avg_server_response_ns") is not None
+                else ""
+            ),
+            "p50_server_response_ns": (
+                f"{stats['p50_server_response_ns']:.3f}"
+                if stats.get("p50_server_response_ns") is not None
+                else ""
+            ),
+            "p99_server_response_ns": (
+                f"{stats['p99_server_response_ns']:.3f}"
+                if stats.get("p99_server_response_ns") is not None
+                else ""
+            ),
             "outdir": str(result_path.parent),
             "log_path": log_path,
         }
@@ -350,6 +450,16 @@ for result_path in sorted(outdir.glob("slow*/result.json")):
                 if steady["steady_avg_reqresp_latency_ns"] is not None
                 else ""
             ),
+            "steady_p50_latency_ns": (
+                f"{steady['steady_p50_latency_ns']:.3f}"
+                if steady["steady_p50_latency_ns"] is not None
+                else ""
+            ),
+            "steady_p99_latency_ns": (
+                f"{steady['steady_p99_latency_ns']:.3f}"
+                if steady["steady_p99_latency_ns"] is not None
+                else ""
+            ),
             "steady_avg_gap_ns": (
                 f"{steady['steady_avg_gap_ns']:.3f}"
                 if steady["steady_avg_gap_ns"] is not None
@@ -358,6 +468,11 @@ for result_path in sorted(outdir.glob("slow*/result.json")):
             "steady_median_gap_ns": (
                 f"{steady['steady_median_gap_ns']:.3f}"
                 if steady["steady_median_gap_ns"] is not None
+                else ""
+            ),
+            "steady_p99_gap_ns": (
+                f"{steady['steady_p99_gap_ns']:.3f}"
+                if steady["steady_p99_gap_ns"] is not None
                 else ""
             ),
             "steady_avg_throughput_mrps": (
@@ -373,6 +488,51 @@ for result_path in sorted(outdir.glob("slow*/result.json")):
             "steady_median_throughput_mrps": (
                 f"{steady['steady_median_throughput_mrps']:.6f}"
                 if steady["steady_median_throughput_mrps"] is not None
+                else ""
+            ),
+            "steady_avg_server_poll_notify_ns": (
+                f"{steady['steady_avg_server_poll_notify_ns']:.3f}"
+                if steady.get("steady_avg_server_poll_notify_ns") is not None
+                else ""
+            ),
+            "steady_p50_server_poll_notify_ns": (
+                f"{steady['steady_p50_server_poll_notify_ns']:.3f}"
+                if steady.get("steady_p50_server_poll_notify_ns") is not None
+                else ""
+            ),
+            "steady_p99_server_poll_notify_ns": (
+                f"{steady['steady_p99_server_poll_notify_ns']:.3f}"
+                if steady.get("steady_p99_server_poll_notify_ns") is not None
+                else ""
+            ),
+            "steady_avg_server_execute_ns": (
+                f"{steady['steady_avg_server_execute_ns']:.3f}"
+                if steady.get("steady_avg_server_execute_ns") is not None
+                else ""
+            ),
+            "steady_p50_server_execute_ns": (
+                f"{steady['steady_p50_server_execute_ns']:.3f}"
+                if steady.get("steady_p50_server_execute_ns") is not None
+                else ""
+            ),
+            "steady_p99_server_execute_ns": (
+                f"{steady['steady_p99_server_execute_ns']:.3f}"
+                if steady.get("steady_p99_server_execute_ns") is not None
+                else ""
+            ),
+            "steady_avg_server_response_ns": (
+                f"{steady['steady_avg_server_response_ns']:.3f}"
+                if steady.get("steady_avg_server_response_ns") is not None
+                else ""
+            ),
+            "steady_p50_server_response_ns": (
+                f"{steady['steady_p50_server_response_ns']:.3f}"
+                if steady.get("steady_p50_server_response_ns") is not None
+                else ""
+            ),
+            "steady_p99_server_response_ns": (
+                f"{steady['steady_p99_server_response_ns']:.3f}"
+                if steady.get("steady_p99_server_response_ns") is not None
                 else ""
             ),
             "first_kept_end_ns": steady["first_kept_end_ns"],

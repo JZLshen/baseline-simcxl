@@ -69,8 +69,38 @@ def fmt_ns(value):
     return f"{value:.3f}"
 
 
+def request_rows_from_log(log_path: Path):
+    parsed = parse_log(log_path)
+    rows = []
+
+    for (client_id, req_id), entry in parsed["timing_by_request"].items():
+        start_ns = entry.get("client_req_start_ts_ns", 0)
+        end_ns = entry.get("client_resp_done_ts_ns", 0)
+
+        if start_ns == 0 or end_ns == 0:
+            continue
+
+        rows.append(
+            {
+                "client_id": client_id,
+                "req_id": req_id,
+                "start_ns": start_ns,
+                "end_ns": end_ns,
+                "latency_ns": end_ns - start_ns,
+            }
+        )
+
+    rows.sort(key=lambda row: (row["client_id"], row["req_id"]))
+    return rows
+
+
 def build_row(item):
-    stats, request_rows, _ = parse_log(item["log_path"])
+    if not item["log_path"].exists():
+        missing_item = dict(item)
+        missing_item["note"] = f"missing log: {item['log_path']}"
+        return build_missing_row(missing_item)
+
+    request_rows = request_rows_from_log(item["log_path"])
     window = compute_window_stats(request_rows)
     steady1 = compute_steady_stats(request_rows, 1)
     steady5 = compute_steady_stats(request_rows, 5)

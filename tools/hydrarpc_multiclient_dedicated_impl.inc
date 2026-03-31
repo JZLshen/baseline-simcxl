@@ -1,3 +1,11 @@
+#if !defined(HYDRARPC_VARIANT_NAME)
+#error "HYDRARPC_VARIANT_NAME must be defined before including hydrarpc_multiclient_dedicated_impl.inc"
+#endif
+
+#if !defined(HYDRARPC_COHERENT)
+#error "HYDRARPC_COHERENT must be defined before including hydrarpc_multiclient_dedicated_impl.inc"
+#endif
+
 #define _GNU_SOURCE
 
 #include <cpuid.h>
@@ -7,7 +15,6 @@
 #include <linux/mempolicy.h>
 #include <sched.h>
 #include <signal.h>
-#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,34 +27,26 @@
 #include <x86intrin.h>
 
 #define CACHELINE_SIZE 64u
-#define QUEUE_STRIDE_WORDS (CACHELINE_SIZE / sizeof(uint64_t))
+#define DEFAULT_REQUEST_PAYLOAD_SIZE 64u
+#define DEFAULT_RESPONSE_PAYLOAD_SIZE 64u
 
-struct Request {
-    uint64_t client_id;
-    uint64_t req_id;
-    uint64_t a;
-    uint64_t b;
-};
+#define NOTIFY_LEN_BITS 14u
+#define NOTIFY_LEN_MAX (1u << NOTIFY_LEN_BITS)
+#define NOTIFY_OFFSET_BITS (64u - 1u - NOTIFY_LEN_BITS)
+#define NOTIFY_OFFSET_MASK ((1ull << NOTIFY_OFFSET_BITS) - 1ull)
+#define NOTIFY_LEN_MASK ((1ull << NOTIFY_LEN_BITS) - 1ull)
+#define NOTIFY_LEN_SHIFT NOTIFY_OFFSET_BITS
+#define NOTIFY_VALID_SHIFT 63u
+#define NOTIFY_VALID_MASK (1ull << NOTIFY_VALID_SHIFT)
 
-struct Response {
-    uint64_t client_id;
-    uint64_t req_id;
-    uint64_t sum;
-};
-
-struct RequestLine {
-    struct Request request;
-    uint8_t padding[CACHELINE_SIZE - sizeof(struct Request)];
-} __attribute__((aligned(CACHELINE_SIZE)));
-
-struct ResponseLine {
-    struct Response response;
-    uint8_t padding[CACHELINE_SIZE - sizeof(struct Response)];
+struct NotifyQueueLine {
+    volatile uint64_t word;
+    uint8_t padding[CACHELINE_SIZE - sizeof(uint64_t)];
 } __attribute__((aligned(CACHELINE_SIZE)));
 
 struct Connection {
-    volatile uint64_t *request_queue;
-    volatile uint64_t *response_queue;
+    volatile struct NotifyQueueLine *request_queue;
+    volatile struct NotifyQueueLine *response_queue;
     uint8_t *request_data_area;
     uint8_t *response_data_area;
 };
@@ -58,11 +57,13 @@ struct SharedControl {
     volatile int rc;
 };
 
-struct BreakdownData {
-    uint64_t *request_publish_ns;
-    uint64_t *server_observe_ns;
-    uint64_t *response_publish_ns;
-    uint64_t *response_observe_ns;
+struct RequestTimingData {
+    uint64_t *client_req_start_ts_ns;
+    uint64_t *client_resp_done_ts_ns;
+    uint64_t *server_req_observe_ts_ns;
+    uint64_t *server_exec_done_ts_ns;
+    uint64_t *server_resp_done_ts_ns;
+    uint64_t *server_loop_start_ts_ns;
 };
 
 enum SendMode {
@@ -72,27 +73,24 @@ enum SendMode {
     SEND_UNEVEN,
 };
 
-enum RecordBreakdownMode {
-    RECORD_BREAKDOWN_NONE = 0,
-    RECORD_BREAKDOWN_BASIC,
+enum TransferMode {
+    TRANSFER_STAGING = 0,
+    TRANSFER_DIRECT,
 };
 
-_Static_assert(sizeof(struct Request) <= CACHELINE_SIZE,
-               "Request must fit within one cacheline-backed slot");
-_Static_assert(sizeof(struct Response) <= CACHELINE_SIZE,
-               "Response must fit within one cacheline-backed slot");
-_Static_assert(sizeof(struct RequestLine) == CACHELINE_SIZE,
-               "RequestLine must occupy exactly one cacheline");
-_Static_assert(sizeof(struct ResponseLine) == CACHELINE_SIZE,
-               "ResponseLine must occupy exactly one cacheline");
-
-static inline void cpu_relax(void);
-static int control_has_error(struct SharedControl *control);
+_Static_assert(sizeof(struct NotifyQueueLine) == CACHELINE_SIZE,
+               "NotifyQueueLine must occupy exactly one cacheline");
 
 static inline uint64_t
 round_up_u64(uint64_t value, uint64_t align)
 {
-    return (value + align - 1) / align * align;
+    return ((value + align - 1u) / align) * align;
+}
+
+static inline uint64_t
+payload_span_u64(uint64_t payload_len)
+{
+    return round_up_u64(payload_len, CACHELINE_SIZE);
 }
 
 static uint64_t
@@ -112,16 +110,11 @@ m5_rpns_ns(void)
     return m5_rpns();
 }
 
+#if !HYDRARPC_COHERENT
 static inline void
 clflushopt_line(const void *ptr)
 {
     asm volatile("clflushopt (%0)" : : "r"(ptr) : "memory");
-}
-
-static inline void
-cpu_relax(void)
-{
-    asm volatile("pause" : : : "memory");
 }
 
 static int
@@ -137,6 +130,7 @@ cpu_has_clflushopt(void)
 
     return ((ebx >> 23) & 0x1u) ? 1 : 0;
 }
+#endif
 
 static int
 pin_to_cpu(int cpu_id)
@@ -195,15 +189,15 @@ parse_send_mode(const char *value)
     exit(2);
 }
 
-static enum RecordBreakdownMode
-parse_record_breakdown_mode(const char *value)
+static enum TransferMode
+parse_transfer_mode(const char *value)
 {
-    if (strcmp(value, "none") == 0)
-        return RECORD_BREAKDOWN_NONE;
-    if (strcmp(value, "basic") == 0)
-        return RECORD_BREAKDOWN_BASIC;
+    if (strcmp(value, "staging") == 0)
+        return TRANSFER_STAGING;
+    if (strcmp(value, "direct") == 0)
+        return TRANSFER_DIRECT;
 
-    fprintf(stderr, "invalid record-breakdown: %s\n", value);
+    fprintf(stderr, "invalid transfer-mode: %s\n", value);
     exit(2);
 }
 
@@ -277,49 +271,151 @@ alloc_shared_cxl(size_t size, int cxl_node)
 }
 
 static inline uint64_t
-slot_offset(uint64_t slot)
+notify_make(uint64_t offset, uint64_t len)
 {
-    return slot * CACHELINE_SIZE;
-}
-
-static inline volatile uint64_t *
-queue_entry_ptr(volatile uint64_t *queue, uint64_t slot)
-{
-    return &queue[slot * QUEUE_STRIDE_WORDS];
-}
-
-static inline uint64_t
-make_queue_entry(uint64_t offset)
-{
-    return offset | 0x1u;
+    return NOTIFY_VALID_MASK |
+           (((len - 1u) & NOTIFY_LEN_MASK) << NOTIFY_LEN_SHIFT) |
+           (offset & NOTIFY_OFFSET_MASK);
 }
 
 static inline int
-queue_entry_is_valid(uint64_t entry)
+notify_valid(uint64_t word)
 {
-    return (int)(entry & 0x1u);
+    return (word & NOTIFY_VALID_MASK) != 0;
 }
 
 static inline uint64_t
-queue_entry_offset(uint64_t entry)
+notify_len(uint64_t word)
 {
-    return entry & ~0x1ull;
+    return ((word >> NOTIFY_LEN_SHIFT) & NOTIFY_LEN_MASK) + 1u;
 }
 
-static int
-queue_offset_to_slot(uint64_t offset, uint64_t slot_count, uint64_t *slot_out)
+static inline uint64_t
+notify_offset(uint64_t word)
 {
-    uint64_t slot = 0;
+    return word & NOTIFY_OFFSET_MASK;
+}
 
-    if ((offset % CACHELINE_SIZE) != 0)
-        return 0;
+static inline volatile struct NotifyQueueLine *
+notify_queue_line_at(volatile struct NotifyQueueLine *queue, uint64_t slot)
+{
+    return &queue[slot];
+}
 
-    slot = offset / CACHELINE_SIZE;
-    if (slot >= slot_count)
-        return 0;
+static inline uint8_t *
+payload_at_offset(uint8_t *area, uint64_t offset)
+{
+    return area + offset;
+}
 
-    *slot_out = slot;
-    return 1;
+#if HYDRARPC_COHERENT
+static inline void
+store_payload_remote(void *dst, const void *src, uint64_t payload_len)
+{
+    memcpy(dst, src, payload_len);
+}
+
+static inline void
+load_payload_remote(void *dst, const void *src, uint64_t payload_len)
+{
+    memcpy(dst, src, payload_len);
+}
+#else
+__attribute__((noinline)) static void
+copy_bytes_to_remote(void *dst, const void *src, size_t len)
+{
+    memcpy(dst, src, len);
+}
+
+__attribute__((noinline)) static void
+copy_bytes_from_remote(void *dst, const void *src, size_t len)
+{
+    volatile const uint8_t *src_bytes =
+        (volatile const uint8_t *)(const void *)src;
+    uint8_t *dst_bytes = (uint8_t *)dst;
+
+    for (size_t i = 0; i < len; i++)
+        dst_bytes[i] = src_bytes[i];
+}
+
+static inline void
+flush_remote_range(const void *ptr, uint64_t len)
+{
+    uintptr_t begin = (uintptr_t)ptr & ~((uintptr_t)CACHELINE_SIZE - 1u);
+    uintptr_t end = round_up_u64((uint64_t)((uintptr_t)ptr + len),
+                                 CACHELINE_SIZE);
+
+    for (uintptr_t cursor = begin; cursor < end; cursor += CACHELINE_SIZE)
+        clflushopt_line((const void *)cursor);
+}
+
+static inline void
+flush_payload_remote_stores(const void *ptr, uint64_t payload_len)
+{
+    flush_remote_range(ptr, payload_len);
+    _mm_sfence();
+}
+
+static inline void
+store_payload_remote(void *dst, const void *src, uint64_t payload_len)
+{
+    copy_bytes_to_remote(dst, src, payload_len);
+    flush_payload_remote_stores(dst, payload_len);
+}
+
+static inline void
+load_payload_remote(void *dst, const void *src, uint64_t payload_len)
+{
+    flush_remote_range(src, payload_len);
+    _mm_mfence();
+    copy_bytes_from_remote(dst, src, payload_len);
+}
+#endif
+
+static inline uint64_t
+load_notify_word_remote(volatile struct NotifyQueueLine *queue_line)
+{
+#if HYDRARPC_COHERENT
+    return __atomic_load_n((const uint64_t *)&queue_line->word,
+                           __ATOMIC_ACQUIRE);
+#else
+    clflushopt_line((const void *)queue_line);
+    _mm_mfence();
+    return __atomic_load_n((const uint64_t *)&queue_line->word,
+                           __ATOMIC_RELAXED);
+#endif
+}
+
+static inline void
+write_notify_word_remote(volatile struct NotifyQueueLine *queue_line,
+                         uint64_t notify_word)
+{
+#if HYDRARPC_COHERENT
+    __atomic_store_n((uint64_t *)&queue_line->word, notify_word, __ATOMIC_RELEASE);
+#else
+    __atomic_store_n((uint64_t *)&queue_line->word, notify_word, __ATOMIC_RELAXED);
+    clflushopt_line((const void *)queue_line);
+    _mm_sfence();
+#endif
+}
+
+static inline void
+clear_notify_word_remote(volatile struct NotifyQueueLine *queue_line)
+{
+#if HYDRARPC_COHERENT
+    __atomic_store_n((uint64_t *)&queue_line->word, 0, __ATOMIC_RELEASE);
+#else
+    __atomic_store_n((uint64_t *)&queue_line->word, 0, __ATOMIC_RELAXED);
+    clflushopt_line((const void *)queue_line);
+    _mm_sfence();
+#endif
+}
+
+static void
+init_notify_ring(volatile struct NotifyQueueLine *queue, uint64_t slot_count)
+{
+    for (uint64_t slot = 0; slot < slot_count; slot++)
+        clear_notify_word_remote(notify_queue_line_at(queue, slot));
 }
 
 static inline size_t
@@ -354,133 +450,14 @@ total_request_limit(uint64_t client_count,
 {
     uint64_t total = 0;
 
-    for (uint64_t client_id = 0; client_id < client_count; client_id++)
+    for (uint64_t client_id = 0; client_id < client_count; client_id++) {
         total += client_request_limit(client_id,
                                       request_count,
                                       slow_client_count,
                                       slow_request_count);
+    }
 
     return total;
-}
-
-static inline struct RequestLine *
-request_at_slot(struct Connection *connection, uint64_t slot)
-{
-    return (struct RequestLine *)(connection->request_data_area + slot_offset(slot));
-}
-
-static inline struct ResponseLine *
-response_at_slot(struct Connection *connection, uint64_t slot)
-{
-    return (struct ResponseLine *)(connection->response_data_area + slot_offset(slot));
-}
-
-static inline struct RequestLine *
-request_at_offset(struct Connection *connection, uint64_t offset)
-{
-    return request_at_slot(connection, offset / CACHELINE_SIZE);
-}
-
-static inline struct ResponseLine *
-response_at_offset(struct Connection *connection, uint64_t offset)
-{
-    return response_at_slot(connection, offset / CACHELINE_SIZE);
-}
-
-__attribute__((noinline)) static void
-copy_line_to_remote(void *dst, const void *src)
-{
-    memcpy(dst, src, CACHELINE_SIZE);
-}
-
-__attribute__((noinline)) static void
-copy_line_from_remote(void *dst, const void *src)
-{
-    volatile const uint8_t *src_bytes =
-        (volatile const uint8_t *)(const void *)src;
-    uint8_t *dst_bytes = (uint8_t *)dst;
-
-    for (size_t i = 0; i < CACHELINE_SIZE; i++)
-        dst_bytes[i] = src_bytes[i];
-}
-
-static inline uint64_t
-read_queue_token_remote(volatile uint64_t *queue_slot)
-{
-    clflushopt_line((const void *)queue_slot);
-    _mm_mfence();
-    return *queue_slot;
-}
-
-static inline void
-write_queue_token_remote(volatile uint64_t *queue_slot, uint64_t token)
-{
-    *queue_slot = token;
-    clflushopt_line((const void *)queue_slot);
-    _mm_sfence();
-}
-
-static inline void
-store_request_remote(struct RequestLine *dst,
-                     uint64_t client_id,
-                     uint64_t req_id,
-                     uint64_t a,
-                     uint64_t b)
-{
-    struct RequestLine line = {0};
-
-    line.request.client_id = client_id;
-    line.request.req_id = req_id;
-    line.request.a = a;
-    line.request.b = b;
-    copy_line_to_remote(dst, &line);
-    clflushopt_line((const void *)dst);
-    _mm_sfence();
-}
-
-static inline void
-load_request_remote(struct Request *dst, const struct RequestLine *src)
-{
-    struct RequestLine line;
-
-    clflushopt_line((const void *)src);
-    _mm_mfence();
-    copy_line_from_remote(&line, src);
-    *dst = line.request;
-}
-
-static inline void
-store_response_remote(struct ResponseLine *dst,
-                      uint64_t client_id,
-                      uint64_t req_id,
-                      uint64_t sum)
-{
-    struct ResponseLine line = {0};
-
-    line.response.client_id = client_id;
-    line.response.req_id = req_id;
-    line.response.sum = sum;
-    copy_line_to_remote(dst, &line);
-    clflushopt_line((const void *)dst);
-    _mm_sfence();
-}
-
-static inline void
-load_response_remote(struct Response *dst, const struct ResponseLine *src)
-{
-    struct ResponseLine line;
-
-    clflushopt_line((const void *)src);
-    _mm_mfence();
-    copy_line_from_remote(&line, src);
-    *dst = line.response;
-}
-
-static void
-init_queue_entries_empty(volatile uint64_t *queue, uint64_t slot_count)
-{
-    for (uint64_t slot = 0; slot < slot_count; slot++)
-        write_queue_token_remote(queue_entry_ptr(queue, slot), 0);
 }
 
 static inline int
@@ -504,10 +481,6 @@ send_is_due(enum SendMode send_mode,
         uint64_t weight_num = 2 * (client_count - client_id);
         uint64_t weight_den = client_count + 1;
 
-        /*
-         * Skew per-client request rates while preserving the same aggregate
-         * offered load as uniform pacing.
-         */
         effective_gap_ns = (uint64_t)((((__uint128_t)send_gap_ns * weight_den) +
                                        weight_num - 1) /
                                       weight_num);
@@ -529,7 +502,6 @@ wait_for_start(volatile uint64_t *start_flag)
 {
     while (__atomic_load_n((const uint64_t *)start_flag, __ATOMIC_ACQUIRE) ==
            0) {
-        cpu_relax();
     }
 }
 
@@ -551,11 +523,115 @@ store_shared_u64(uint64_t *ptr, uint64_t value)
     __atomic_store_n(ptr, value, __ATOMIC_RELAXED);
 }
 
+static inline uint64_t
+min_u64(uint64_t lhs, uint64_t rhs)
+{
+    return lhs < rhs ? lhs : rhs;
+}
+
 static void
 signal_ready_and_wait(struct SharedControl *control)
 {
     __atomic_fetch_add(&control->ready_count, 1, __ATOMIC_RELEASE);
     wait_for_start(&control->start_flag);
+}
+
+static inline uint8_t *
+request_shadow_at(uint8_t *buffer, uint64_t seq, uint64_t request_payload_size)
+{
+    return buffer + (size_t)(seq * request_payload_size);
+}
+
+static void
+fill_random_payload_bytes(uint8_t *dst, uint64_t payload_len, uint64_t *rng_state)
+{
+    uint64_t offset = 0;
+
+    while (offset < payload_len) {
+        uint64_t word = next_rand(rng_state);
+        uint64_t chunk_len = min_u64(payload_len - offset, sizeof(word));
+
+        memcpy(dst + offset, &word, (size_t)chunk_len);
+        offset += chunk_len;
+    }
+}
+
+static void
+build_response_payload_bytes(uint8_t *dst,
+                             uint64_t response_payload_size,
+                             const uint8_t *request_bytes,
+                             uint64_t request_payload_size)
+{
+    uint64_t copy_len = min_u64(response_payload_size, request_payload_size);
+
+    memcpy(dst, request_bytes, (size_t)copy_len);
+    if (response_payload_size > copy_len) {
+        memset(dst + copy_len,
+               0,
+               (size_t)(response_payload_size - copy_len));
+    }
+}
+
+static int
+response_matches_request(const uint8_t *response_bytes,
+                         uint64_t response_payload_size,
+                         const uint8_t *request_bytes,
+                         uint64_t request_payload_size)
+{
+    uint64_t copy_len = min_u64(response_payload_size, request_payload_size);
+
+    if (memcmp(response_bytes, request_bytes, (size_t)copy_len) != 0)
+        return 0;
+
+    for (uint64_t i = copy_len; i < response_payload_size; i++) {
+        if (response_bytes[i] != 0)
+            return 0;
+    }
+
+    return 1;
+}
+
+static void
+store_request_payload(uint8_t *remote_dst,
+                      uint8_t *request_shadow,
+                      uint64_t request_payload_size,
+                      uint64_t *rng_state,
+                      enum TransferMode transfer_mode)
+{
+    if (transfer_mode == TRANSFER_STAGING) {
+        fill_random_payload_bytes(request_shadow, request_payload_size, rng_state);
+        store_payload_remote(remote_dst, request_shadow, request_payload_size);
+        return;
+    }
+
+    fill_random_payload_bytes(request_shadow, request_payload_size, rng_state);
+    memcpy(remote_dst, request_shadow, (size_t)request_payload_size);
+#if !HYDRARPC_COHERENT
+    flush_payload_remote_stores(remote_dst, request_payload_size);
+#endif
+}
+
+static void
+store_response_payload(uint8_t *remote_dst,
+                       uint64_t response_payload_size,
+                       const uint8_t *request_bytes,
+                       uint64_t request_payload_size,
+                       enum TransferMode transfer_mode,
+                       uint8_t *response_staging)
+{
+    build_response_payload_bytes(response_staging,
+                                 response_payload_size,
+                                 request_bytes,
+                                 request_payload_size);
+    if (transfer_mode == TRANSFER_STAGING) {
+        store_payload_remote(remote_dst, response_staging, response_payload_size);
+        return;
+    }
+
+    memcpy(remote_dst, response_staging, (size_t)response_payload_size);
+#if !HYDRARPC_COHERENT
+    flush_payload_remote_stores(remote_dst, response_payload_size);
+#endif
 }
 
 static int
@@ -566,20 +642,29 @@ run_server_dedicated(struct Connection *connections,
                      uint64_t slow_client_count,
                      uint64_t slow_request_count,
                      uint64_t total_request_target,
-                     struct BreakdownData *breakdown,
+                     uint64_t request_payload_size,
+                     uint64_t response_payload_size,
+                     enum TransferMode response_transfer_mode,
+                     struct RequestTimingData *timing,
                      int server_cpu,
                      struct SharedControl *control)
 {
     uint64_t *next_seq = calloc((size_t)client_count, sizeof(*next_seq));
+    uint64_t *response_data_tail =
+        calloc((size_t)client_count, sizeof(*response_data_tail));
     uint64_t completed_total = 0;
     uint64_t next_client_hint = 0;
-    struct Request request_local;
-    struct Response response_local;
+    uint8_t *request_payload_local = malloc((size_t)request_payload_size);
+    uint8_t *response_staging = malloc((size_t)response_payload_size);
 
-    if (next_seq == NULL) {
+    if (next_seq == NULL || response_data_tail == NULL ||
+        request_payload_local == NULL || response_staging == NULL) {
         fprintf(stderr, "server tracking allocation failed\n");
         set_control_error(control);
         free(next_seq);
+        free(response_data_tail);
+        free(request_payload_local);
+        free(response_staging);
         return 1;
     }
 
@@ -587,10 +672,14 @@ run_server_dedicated(struct Connection *connections,
         fprintf(stderr, "failed to pin server to cpu %d\n", server_cpu);
         set_control_error(control);
         free(next_seq);
+        free(response_data_tail);
+        free(request_payload_local);
+        free(response_staging);
         return 1;
     }
 
     signal_ready_and_wait(control);
+    store_shared_u64(timing->server_loop_start_ts_ns, m5_rpns_ns());
 
     while (completed_total < total_request_target &&
            !control_has_error(control)) {
@@ -608,88 +697,73 @@ run_server_dedicated(struct Connection *connections,
                                                                  slow_client_count,
                                                                  slow_request_count);
             uint64_t slot = 0;
-            uint64_t request_entry = 0;
-            uint64_t response_entry = 0;
+            uint64_t request_notify = 0;
+            uint64_t response_notify = 0;
+            uint64_t request_len = 0;
             uint64_t request_offset = 0;
             uint64_t response_offset = 0;
-            uint64_t request_slot = 0;
+            uint64_t server_req_observe_ts = 0;
+            uint64_t server_exec_done_ts = 0;
+            uint64_t server_resp_done_ts = 0;
             size_t index = 0;
-            volatile uint64_t *request_queue_slot = NULL;
-            volatile uint64_t *response_queue_slot = NULL;
-            struct RequestLine *request = NULL;
-            struct ResponseLine *response = NULL;
+            volatile struct NotifyQueueLine *request_queue_line = NULL;
+            volatile struct NotifyQueueLine *response_queue_line = NULL;
 
             if (seq >= client_request_count)
                 continue;
 
             slot = seq % slot_count;
             index = request_result_index(client_id, seq, request_count);
-            request_queue_slot =
-                queue_entry_ptr(connection->request_queue, slot);
-            response_queue_slot =
-                queue_entry_ptr(connection->response_queue, slot);
-            request_entry = read_queue_token_remote(request_queue_slot);
-            if (!queue_entry_is_valid(request_entry))
-                continue;
-            if (breakdown != NULL &&
-                breakdown->server_observe_ns != NULL &&
-                breakdown->server_observe_ns[index] == 0) {
-                store_shared_u64(&breakdown->server_observe_ns[index],
-                                 m5_rpns_ns());
-            }
-            response_entry = read_queue_token_remote(response_queue_slot);
-            if (queue_entry_is_valid(response_entry))
+            request_queue_line =
+                notify_queue_line_at(connection->request_queue, slot);
+            response_queue_line =
+                notify_queue_line_at(connection->response_queue, slot);
+            request_notify = load_notify_word_remote(request_queue_line);
+            if (!notify_valid(request_notify))
                 continue;
 
-            request_offset = queue_entry_offset(request_entry);
-            if (!queue_offset_to_slot(request_offset, slot_count, &request_slot)) {
-                fprintf(stderr,
-                        "server request offset invalid client=%" PRIu64
-                        " seq=%" PRIu64 " entry=0x%016" PRIx64 "\n",
-                        client_id,
-                        seq,
-                        request_entry);
+            response_notify = load_notify_word_remote(response_queue_line);
+            if (notify_valid(response_notify))
+                continue;
+
+            request_len = notify_len(request_notify);
+            if (request_len != request_payload_size) {
+                fprintf(stderr, "server observed unexpected request length\n");
                 set_control_error(control);
                 break;
             }
 
-            request = request_at_offset(connection, request_offset);
-            load_request_remote(&request_local, request);
-            if (request_local.client_id != client_id ||
-                request_local.req_id != seq) {
-                fprintf(stderr,
-                        "server request metadata mismatch client=%" PRIu64
-                        " seq=%" PRIu64 " payload_client=%" PRIu64
-                        " payload_req=%" PRIu64 "\n",
-                        client_id,
-                        seq,
-                        request_local.client_id,
-                        request_local.req_id);
-                set_control_error(control);
-                break;
-            }
+            server_req_observe_ts = m5_rpns_ns();
+            request_offset = notify_offset(request_notify);
+            load_payload_remote(request_payload_local,
+                                payload_at_offset(connection->request_data_area,
+                                                  request_offset),
+                                request_len);
+            server_exec_done_ts = m5_rpns_ns();
 
-            write_queue_token_remote(request_queue_slot, 0);
+            clear_notify_word_remote(request_queue_line);
 
-            response_offset = slot_offset(slot);
-            response = response_at_offset(connection, response_offset);
-            response_local.client_id = client_id;
-            response_local.req_id = seq;
-            response_local.sum = request_local.a + request_local.b;
+            response_offset = response_data_tail[client_id];
+            store_response_payload(
+                payload_at_offset(connection->response_data_area, response_offset),
+                response_payload_size,
+                request_payload_local,
+                request_payload_size,
+                response_transfer_mode,
+                response_staging
+            );
+            write_notify_word_remote(response_queue_line,
+                                     notify_make(response_offset,
+                                                 response_payload_size));
+            server_resp_done_ts = m5_rpns_ns();
+            store_shared_u64(&timing->server_req_observe_ts_ns[index],
+                             server_req_observe_ts);
+            store_shared_u64(&timing->server_exec_done_ts_ns[index],
+                             server_exec_done_ts);
+            store_shared_u64(&timing->server_resp_done_ts_ns[index],
+                             server_resp_done_ts);
 
-            store_response_remote(response,
-                                  response_local.client_id,
-                                  response_local.req_id,
-                                  response_local.sum);
-            write_queue_token_remote(response_queue_slot,
-                                     make_queue_entry(response_offset));
-            if (breakdown != NULL) {
-                if (breakdown->response_publish_ns != NULL) {
-                    store_shared_u64(&breakdown->response_publish_ns[index],
-                                     m5_rpns_ns());
-                }
-            }
-
+            response_data_tail[client_id] += payload_span_u64(response_payload_size);
             next_seq[client_id]++;
             completed_total++;
             next_client_hint = (client_id + 1) % client_count;
@@ -698,14 +772,15 @@ run_server_dedicated(struct Connection *connections,
         }
 
         if (!made_progress) {
-            cpu_relax();
         }
     }
 
     free(next_seq);
+    free(response_data_tail);
+    free(request_payload_local);
+    free(response_staging);
     return control_has_error(control) ? 1 : 0;
 }
-
 
 static int
 run_client_dedicated(struct Connection *connection,
@@ -716,12 +791,13 @@ run_client_dedicated(struct Connection *connection,
                      uint64_t request_count,
                      uint64_t slow_client_count,
                      uint64_t slow_request_count,
+                     uint64_t request_payload_size,
+                     uint64_t response_payload_size,
                      enum SendMode send_mode,
                      uint64_t send_gap_ns,
                      uint64_t slow_send_gap_ns,
-                     struct BreakdownData *breakdown,
-                     uint64_t *start_ns,
-                     uint64_t *end_ns,
+                     enum TransferMode request_transfer_mode,
+                     struct RequestTimingData *timing,
                      struct SharedControl *control)
 {
     size_t base = (size_t)(client_id * request_count);
@@ -732,18 +808,22 @@ run_client_dedicated(struct Connection *connection,
     uint64_t rng_state = client_id + 1;
     uint64_t sent = 0;
     uint64_t completed = 0;
+    uint64_t request_data_tail = 0;
     uint64_t send_schedule_base_ns = 0;
     uint64_t active_window_size = 1;
     uint64_t steady_schedule_started = 0;
     enum SendMode effective_send_mode = send_mode;
     uint64_t effective_send_gap_ns = send_gap_ns;
-    uint64_t *expected_local = calloc((size_t)client_request_count, sizeof(*expected_local));
+    uint8_t *request_shadow_local = calloc((size_t)client_request_count,
+                                           (size_t)request_payload_size);
+    uint8_t *response_local = malloc((size_t)response_payload_size);
 
-    if (expected_local == NULL) {
+    if (request_shadow_local == NULL || response_local == NULL) {
         fprintf(stderr, "client %" PRIu64 " local tracking allocation failed\n",
                 client_id);
         set_control_error(control);
-        free(expected_local);
+        free(request_shadow_local);
+        free(response_local);
         return 1;
     }
 
@@ -752,7 +832,8 @@ run_client_dedicated(struct Connection *connection,
                 client_id,
                 client_id);
         set_control_error(control);
-        free(expected_local);
+        free(request_shadow_local);
+        free(response_local);
         return 1;
     }
 
@@ -767,28 +848,18 @@ run_client_dedicated(struct Connection *connection,
     while (completed < client_request_count && !control_has_error(control)) {
         int made_progress = 0;
 
-        /*
-         * Keep each client's first RPC fully serialized, then reopen the
-         * configured steady-state window for the remaining requests.
-         */
         active_window_size = (completed == 0) ? 1 : window_size;
 
         if (completed > 0 && !steady_schedule_started) {
-            /*
-             * Non-greedy pacing for the remaining requests should start only
-             * after the first end-to-end RPC has completed.
-             */
             send_schedule_base_ns = m5_rpns_ns();
             steady_schedule_started = 1;
         }
 
-        if (sent < client_request_count && (sent - completed) < active_window_size) {
+        if (sent < client_request_count &&
+            (sent - completed) < active_window_size) {
             uint64_t slot = sent % slot_count;
-            uint64_t request_offset = slot_offset(slot);
-            volatile uint64_t *request_queue_slot = queue_entry_ptr(
-                connection->request_queue, slot
-            );
-            struct RequestLine *request = request_at_offset(connection, request_offset);
+            volatile struct NotifyQueueLine *request_queue_line =
+                notify_queue_line_at(connection->request_queue, slot);
 
             if (send_is_due(effective_send_mode,
                             effective_send_gap_ns,
@@ -796,25 +867,31 @@ run_client_dedicated(struct Connection *connection,
                             client_id,
                             sent,
                             send_schedule_base_ns)) {
-                if (!queue_entry_is_valid(read_queue_token_remote(request_queue_slot))) {
-                    uint64_t a = next_rand(&rng_state);
-                    uint64_t b = next_rand(&rng_state);
-                    uint64_t expected = a + b;
-                    uint64_t start = m5_rpns_ns();
+                if (!notify_valid(load_notify_word_remote(request_queue_line))) {
+                    uint64_t start = 0;
+                    uint64_t request_offset = request_data_tail;
                     size_t index = base + sent;
+                    uint8_t *request_shadow =
+                        request_shadow_at(request_shadow_local,
+                                          sent,
+                                          request_payload_size);
 
-                    store_shared_u64(&start_ns[index], start);
-                    expected_local[sent] = expected;
-                    store_request_remote(request, client_id, sent, a, b);
-                    write_queue_token_remote(request_queue_slot,
-                                             make_queue_entry(request_offset));
-                    if (breakdown != NULL) {
-                        if (breakdown->request_publish_ns != NULL) {
-                            store_shared_u64(&breakdown->request_publish_ns[index],
-                                             m5_rpns_ns());
-                        }
-                    }
+                    start = m5_rpns_ns();
 
+                    store_shared_u64(&timing->client_req_start_ts_ns[index], start);
+                    store_request_payload(
+                        payload_at_offset(connection->request_data_area,
+                                          request_offset),
+                        request_shadow,
+                        request_payload_size,
+                        &rng_state,
+                        request_transfer_mode
+                    );
+                    write_notify_word_remote(request_queue_line,
+                                             notify_make(request_offset,
+                                                         request_payload_size));
+
+                    request_data_tail += payload_span_u64(request_payload_size);
                     sent++;
                     made_progress = 1;
                 }
@@ -823,84 +900,62 @@ run_client_dedicated(struct Connection *connection,
 
         if (completed < sent) {
             uint64_t slot = completed % slot_count;
-            uint64_t response_entry = 0;
-            uint64_t response_offset = 0;
-            uint64_t response_slot = 0;
-            volatile uint64_t *response_queue_slot = queue_entry_ptr(
-                connection->response_queue, slot
-            );
+            volatile struct NotifyQueueLine *response_queue_line =
+                notify_queue_line_at(connection->response_queue, slot);
+            uint64_t response_notify = load_notify_word_remote(response_queue_line);
 
-            response_entry = read_queue_token_remote(response_queue_slot);
-            if (queue_entry_is_valid(response_entry)) {
-                struct ResponseLine *response = NULL;
-                struct Response response_local;
-                uint64_t expected = expected_local[completed];
-                uint64_t sum = 0;
-                uint64_t response_observe = 0;
+            if (notify_valid(response_notify)) {
+                uint64_t response_len = notify_len(response_notify);
+                uint64_t response_offset = notify_offset(response_notify);
+                uint8_t *request_shadow =
+                    request_shadow_at(request_shadow_local,
+                                      completed,
+                                      request_payload_size);
                 uint64_t end = 0;
 
-                response_offset = queue_entry_offset(response_entry);
-                if (!queue_offset_to_slot(response_offset, slot_count, &response_slot)) {
+                if (response_len != response_payload_size) {
                     fprintf(stderr,
-                            "client response offset invalid client=%" PRIu64
-                            " req=%" PRIu64 " entry=0x%016" PRIx64 "\n",
-                            client_id,
-                            completed,
-                            response_entry);
+                            "client %" PRIu64 " observed unexpected response length\n",
+                            client_id);
                     set_control_error(control);
                     break;
                 }
-                response = response_at_offset(connection, response_offset);
 
-                response_observe = m5_rpns_ns();
-                load_response_remote(&response_local, response);
-                if (response_local.client_id != client_id ||
-                    response_local.req_id != completed) {
+                load_payload_remote(
+                    response_local,
+                    payload_at_offset(connection->response_data_area,
+                                      response_offset),
+                    response_len
+                );
+                if (!response_matches_request(response_local,
+                                             response_payload_size,
+                                             request_shadow,
+                                             request_payload_size)) {
                     fprintf(stderr,
-                            "client response metadata mismatch client=%" PRIu64
-                            " completed=%" PRIu64 " payload_client=%" PRIu64
-                            " payload_req=%" PRIu64 "\n",
+                            "client response payload mismatch client=%" PRIu64
+                            " req=%" PRIu64 "\n",
                             client_id,
-                            completed,
-                            response_local.client_id,
-                            response_local.req_id);
+                            completed);
                     set_control_error(control);
                     break;
                 }
-                sum = response_local.sum;
-                if (sum != expected) {
-                    fprintf(stderr,
-                            "client response sum mismatch client=%" PRIu64
-                            " req=%" PRIu64 " expected=%" PRIu64
-                            " actual=%" PRIu64 "\n",
-                            client_id,
-                            completed,
-                            expected,
-                            sum);
-                    set_control_error(control);
-                    break;
-                }
+
                 end = m5_rpns_ns();
-
-                if (breakdown != NULL) {
-                    if (breakdown->response_observe_ns != NULL) {
-                        store_shared_u64(&breakdown->response_observe_ns[base + completed],
-                                         response_observe);
-                    }
-                }
-                store_shared_u64(&end_ns[base + completed], end);
-                write_queue_token_remote(response_queue_slot, 0);
+                store_shared_u64(&timing->client_resp_done_ts_ns[base + completed],
+                                 end);
+                clear_notify_word_remote(response_queue_line);
 
                 completed++;
                 made_progress = 1;
             }
         }
 
-        if (!made_progress)
-            cpu_relax();
+        if (!made_progress) {
+        }
     }
 
-    free(expected_local);
+    free(request_shadow_local);
+    free(response_local);
     return control_has_error(control) ? 1 : 0;
 }
 
@@ -930,10 +985,11 @@ write_results(FILE *stream,
               uint64_t request_count,
               uint64_t slow_client_count,
               uint64_t slow_request_count,
-              struct BreakdownData *breakdown,
-              uint64_t *start_ns,
-              uint64_t *end_ns)
+              struct RequestTimingData *timing)
 {
+    fprintf(stream,
+            "server_loop_start_ts_ns=%" PRIu64 "\n",
+            *timing->server_loop_start_ts_ns);
     for (uint64_t client_id = 0; client_id < client_count; client_id++) {
         uint64_t client_request_count = client_request_limit(client_id,
                                                              request_count,
@@ -944,49 +1000,35 @@ write_results(FILE *stream,
             size_t index = (size_t)(client_id * request_count + req_id);
 
             fprintf(stream,
-                    "client_%" PRIu64 "_req_%" PRIu64 "_start_ns=%" PRIu64 "\n",
+                    "client_%" PRIu64 "_req_%" PRIu64
+                    "_client_req_start_ts_ns=%" PRIu64 "\n",
                     client_id,
                     req_id,
-                    start_ns[index]);
+                    timing->client_req_start_ts_ns[index]);
             fprintf(stream,
-                    "client_%" PRIu64 "_req_%" PRIu64 "_end_ns=%" PRIu64 "\n",
+                    "client_%" PRIu64 "_req_%" PRIu64
+                    "_client_resp_done_ts_ns=%" PRIu64 "\n",
                     client_id,
                     req_id,
-                    end_ns[index]);
-            if (breakdown != NULL) {
-                if (breakdown->request_publish_ns != NULL) {
-                    fprintf(stream,
-                            "client_%" PRIu64 "_req_%" PRIu64
-                            "_request_publish_ns=%" PRIu64 "\n",
-                            client_id,
-                            req_id,
-                            breakdown->request_publish_ns[index]);
-                }
-                if (breakdown->server_observe_ns != NULL) {
-                    fprintf(stream,
-                            "client_%" PRIu64 "_req_%" PRIu64
-                            "_server_observe_ns=%" PRIu64 "\n",
-                            client_id,
-                            req_id,
-                            breakdown->server_observe_ns[index]);
-                }
-                if (breakdown->response_publish_ns != NULL) {
-                    fprintf(stream,
-                            "client_%" PRIu64 "_req_%" PRIu64
-                            "_response_publish_ns=%" PRIu64 "\n",
-                            client_id,
-                            req_id,
-                            breakdown->response_publish_ns[index]);
-                }
-                if (breakdown->response_observe_ns != NULL) {
-                    fprintf(stream,
-                            "client_%" PRIu64 "_req_%" PRIu64
-                            "_response_observe_ns=%" PRIu64 "\n",
-                            client_id,
-                            req_id,
-                            breakdown->response_observe_ns[index]);
-                }
-            }
+                    timing->client_resp_done_ts_ns[index]);
+            fprintf(stream,
+                    "client_%" PRIu64 "_req_%" PRIu64
+                    "_server_req_observe_ts_ns=%" PRIu64 "\n",
+                    client_id,
+                    req_id,
+                    timing->server_req_observe_ts_ns[index]);
+            fprintf(stream,
+                    "client_%" PRIu64 "_req_%" PRIu64
+                    "_server_exec_done_ts_ns=%" PRIu64 "\n",
+                    client_id,
+                    req_id,
+                    timing->server_exec_done_ts_ns[index]);
+            fprintf(stream,
+                    "client_%" PRIu64 "_req_%" PRIu64
+                    "_server_resp_done_ts_ns=%" PRIu64 "\n",
+                    client_id,
+                    req_id,
+                    timing->server_resp_done_ts_ns[index]);
         }
     }
 }
@@ -998,9 +1040,7 @@ print_results_with_rc(FILE *stream,
                       uint64_t request_count,
                       uint64_t slow_client_count,
                       uint64_t slow_request_count,
-                      struct BreakdownData *breakdown,
-                      uint64_t *start_ns,
-                      uint64_t *end_ns)
+                      struct RequestTimingData *timing)
 {
     fprintf(stream, "benchmark_rc=%d\n", rc);
     write_results(stream,
@@ -1008,38 +1048,39 @@ print_results_with_rc(FILE *stream,
                   request_count,
                   slow_client_count,
                   slow_request_count,
-                  breakdown,
-                  start_ns,
-                  end_ns);
+                  timing);
 }
 
 int
 main(int argc, char **argv)
 {
     uint64_t client_count = 1;
-    uint64_t request_count = 8;
+    uint64_t request_count = 30;
     uint64_t window_size = 16;
     uint64_t slot_count = 0;
     uint64_t slow_client_count = 0;
     uint64_t slow_request_count = 0;
+    uint64_t request_payload_size = DEFAULT_REQUEST_PAYLOAD_SIZE;
+    uint64_t response_payload_size = DEFAULT_RESPONSE_PAYLOAD_SIZE;
     int cxl_node = 1;
     int server_cpu = -1;
     uint64_t send_gap_ns = 0;
     uint64_t slow_send_gap_ns = 0;
     enum SendMode send_mode = SEND_GREEDY;
-    enum RecordBreakdownMode record_breakdown = RECORD_BREAKDOWN_NONE;
+    enum TransferMode request_transfer_mode = TRANSFER_STAGING;
+    enum TransferMode response_transfer_mode = TRANSFER_STAGING;
     long online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
     uint64_t total_requests = 0;
     uint64_t total_request_target = 0;
+    uint64_t request_span = 0;
+    uint64_t response_span = 0;
     size_t request_queue_size = 0;
     size_t response_queue_size = 0;
     size_t request_data_size = 0;
     size_t response_data_size = 0;
     struct Connection *connections = NULL;
     struct SharedControl *control = NULL;
-    struct BreakdownData breakdown = {0};
-    uint64_t *start_ns = NULL;
-    uint64_t *end_ns = NULL;
+    struct RequestTimingData timing = {0};
     pid_t *child_pids = NULL;
     uint64_t created_children = 0;
     int rc = 0;
@@ -1054,6 +1095,10 @@ main(int argc, char **argv)
             window_size = parse_u64("window-size", argv[++i]);
         } else if (strcmp(argv[i], "--slot-count") == 0 && i + 1 < argc) {
             slot_count = parse_u64("slot-count", argv[++i]);
+        } else if (strcmp(argv[i], "--req-bytes") == 0 && i + 1 < argc) {
+            request_payload_size = parse_u64("req-bytes", argv[++i]);
+        } else if (strcmp(argv[i], "--resp-bytes") == 0 && i + 1 < argc) {
+            response_payload_size = parse_u64("resp-bytes", argv[++i]);
         } else if (strcmp(argv[i], "--slow-client-count") == 0 &&
                    i + 1 < argc) {
             slow_client_count = parse_u64("slow-client-count", argv[++i]);
@@ -1071,34 +1116,48 @@ main(int argc, char **argv)
         } else if (strcmp(argv[i], "--slow-send-gap-ns") == 0 &&
                    i + 1 < argc) {
             slow_send_gap_ns = parse_u64("slow-send-gap-ns", argv[++i]);
-        } else if (strcmp(argv[i], "--record-breakdown") == 0 &&
+        } else if (strcmp(argv[i], "--request-transfer-mode") == 0 &&
                    i + 1 < argc) {
-            record_breakdown = parse_record_breakdown_mode(argv[++i]);
+            request_transfer_mode = parse_transfer_mode(argv[++i]);
+        } else if (strcmp(argv[i], "--response-transfer-mode") == 0 &&
+                   i + 1 < argc) {
+            response_transfer_mode = parse_transfer_mode(argv[++i]);
         } else if (strcmp(argv[i], "--help") == 0 ||
                    strcmp(argv[i], "-h") == 0) {
             printf("Usage: %s [--client-count N] [--count-per-client N] "
                    "[--window-size N] [--slot-count N] "
+                   "[--req-bytes N] [--resp-bytes N] "
                    "[--slow-client-count N] [--slow-count-per-client N] "
                    "[--slow-send-gap-ns N] [--cxl-node N] "
                    "[--send-mode greedy|uniform|staggered|uneven] "
                    "[--send-gap-ns N] "
-                   "[--record-breakdown none|basic] "
-                   "[--server-cpu N] "
-                   "\n"
+                   "[--request-transfer-mode staging|direct] "
+                   "[--response-transfer-mode staging|direct] "
+                   "[--server-cpu N]\n"
                    "  window-size is max outstanding requests per client "
                    "after each client's first RPC completes; default is 16\n"
-                   "  slot-count is per-client ring depth; default is "
-                   "min(window-size, count-per-client)\n"
-                   "  slow-client-count marks the first N client ids as slow;"
-                   " slow clients send slow-count-per-client requests using "
+                   "  slot-count is per-client request/response notify-ring depth; "
+                   "default is min(window-size, count-per-client)\n"
+                   "  req-bytes/resp-bytes set the request/response payload sizes; "
+                   "defaults are %" PRIu64 "/%" PRIu64 " bytes\n"
+                   "  each client owns independent request/response data areas; "
+                   "payload areas are append-only and payloads carry no header\n"
+                   "  request-transfer-mode controls how clients publish request "
+                   "payloads; response-transfer-mode controls how the server "
+                   "publishes response payloads\n"
+                   "  raw timing output always records client request-start / "
+                   "response-done timestamps and server observe / exec-done / "
+                   "response-done timestamps\n"
+                   "  slow-client-count marks the first N client ids as slow; "
+                   "slow clients send slow-count-per-client requests using "
                    "uniform pacing with slow-send-gap-ns\n"
                    "  send-mode=uniform keeps a fixed inter-request gap per "
                    "client; staggered adds a client_id*send-gap-ns start "
                    "offset; uneven skews per-client rates while preserving "
-                   "aggregate offered load\n"
-                   "  record-breakdown controls extra stage timestamps; "
-                   "start/end timestamps are always recorded\n",
-                   argv[0]);
+                   "aggregate offered load\n",
+                   argv[0],
+                   (uint64_t)DEFAULT_REQUEST_PAYLOAD_SIZE,
+                   (uint64_t)DEFAULT_RESPONSE_PAYLOAD_SIZE);
             return 0;
         } else {
             fprintf(stderr, "unknown argument: %s\n", argv[i]);
@@ -1106,11 +1165,14 @@ main(int argc, char **argv)
         }
     }
 
+#if !HYDRARPC_COHERENT
     if (!cpu_has_clflushopt()) {
         fprintf(stderr,
-                "clflushopt is required for hydrarpc_multiclient_dedicated_send1_poll1\n");
+                "clflushopt is required for %s\n",
+                HYDRARPC_VARIANT_NAME);
         return 2;
     }
+#endif
 
     if (client_count == 0) {
         fprintf(stderr, "client-count must be positive\n");
@@ -1120,6 +1182,22 @@ main(int argc, char **argv)
 
     if (request_count == 0) {
         fprintf(stderr, "count-per-client must be positive\n");
+        rc = 2;
+        goto cleanup;
+    }
+
+    if (request_payload_size == 0 || request_payload_size > NOTIFY_LEN_MAX) {
+        fprintf(stderr,
+                "req-bytes must be in [1, %u]\n",
+                (unsigned)NOTIFY_LEN_MAX);
+        rc = 2;
+        goto cleanup;
+    }
+
+    if (response_payload_size == 0 || response_payload_size > NOTIFY_LEN_MAX) {
+        fprintf(stderr,
+                "resp-bytes must be in [1, %u]\n",
+                (unsigned)NOTIFY_LEN_MAX);
         rc = 2;
         goto cleanup;
     }
@@ -1174,12 +1252,12 @@ main(int argc, char **argv)
     if (server_cpu < 0)
         server_cpu = (int)client_count;
 
-    if (slot_count == 0)
+    if (slot_count == 0) {
         slot_count = window_size < request_count ? window_size : request_count;
+    }
 
     if (slot_count == 0) {
-        fprintf(stderr,
-                "slot-count must be positive after defaulting\n");
+        fprintf(stderr, "slot-count must be positive after defaulting\n");
         rc = 2;
         goto cleanup;
     }
@@ -1207,32 +1285,43 @@ main(int argc, char **argv)
                                                request_count,
                                                slow_client_count,
                                                slow_request_count);
-    request_queue_size = sizeof(*connections->request_queue) * slot_count *
-                         QUEUE_STRIDE_WORDS;
-    response_queue_size = sizeof(*connections->response_queue) * slot_count *
-                          QUEUE_STRIDE_WORDS;
-    request_data_size = (size_t)(CACHELINE_SIZE * slot_count);
-    response_data_size = (size_t)(CACHELINE_SIZE * slot_count);
+    request_span = payload_span_u64(request_payload_size);
+    response_span = payload_span_u64(response_payload_size);
+    request_queue_size = sizeof(struct NotifyQueueLine) * slot_count;
+    response_queue_size = sizeof(struct NotifyQueueLine) * slot_count;
+    request_data_size = (size_t)(request_count * request_span);
+    response_data_size = (size_t)(request_count * response_span);
+
+    if ((uint64_t)request_data_size > NOTIFY_OFFSET_MASK + 1u ||
+        (uint64_t)response_data_size > NOTIFY_OFFSET_MASK + 1u) {
+        fprintf(stderr,
+                "dedicated payload area exceeds %" PRIu64 "-bit notify offset range\n",
+                (uint64_t)NOTIFY_OFFSET_BITS);
+        rc = 2;
+        goto cleanup;
+    }
 
     connections = calloc((size_t)client_count, sizeof(*connections));
     child_pids = calloc((size_t)(client_count + 1), sizeof(*child_pids));
     control = alloc_shared_zeroed(sizeof(*control));
-    start_ns = alloc_shared_zeroed(sizeof(*start_ns) * total_requests);
-    end_ns = alloc_shared_zeroed(sizeof(*end_ns) * total_requests);
-    if (record_breakdown >= RECORD_BREAKDOWN_BASIC) {
-        breakdown.request_publish_ns = alloc_shared_zeroed(
-            sizeof(*breakdown.request_publish_ns) * total_requests
-        );
-        breakdown.server_observe_ns = alloc_shared_zeroed(
-            sizeof(*breakdown.server_observe_ns) * total_requests
-        );
-        breakdown.response_publish_ns = alloc_shared_zeroed(
-            sizeof(*breakdown.response_publish_ns) * total_requests
-        );
-        breakdown.response_observe_ns = alloc_shared_zeroed(
-            sizeof(*breakdown.response_observe_ns) * total_requests
-        );
-    }
+    timing.client_req_start_ts_ns = alloc_shared_zeroed(
+        sizeof(*timing.client_req_start_ts_ns) * total_requests
+    );
+    timing.client_resp_done_ts_ns = alloc_shared_zeroed(
+        sizeof(*timing.client_resp_done_ts_ns) * total_requests
+    );
+    timing.server_req_observe_ts_ns = alloc_shared_zeroed(
+        sizeof(*timing.server_req_observe_ts_ns) * total_requests
+    );
+    timing.server_exec_done_ts_ns = alloc_shared_zeroed(
+        sizeof(*timing.server_exec_done_ts_ns) * total_requests
+    );
+    timing.server_resp_done_ts_ns = alloc_shared_zeroed(
+        sizeof(*timing.server_resp_done_ts_ns) * total_requests
+    );
+    timing.server_loop_start_ts_ns = alloc_shared_zeroed(
+        sizeof(*timing.server_loop_start_ts_ns)
+    );
 
     if (connections == NULL || child_pids == NULL) {
         fprintf(stderr, "allocation failed for connections/child pids\n");
@@ -1249,8 +1338,8 @@ main(int argc, char **argv)
             alloc_shared_cxl(request_data_size, cxl_node);
         connections[client_id].response_data_area =
             alloc_shared_cxl(response_data_size, cxl_node);
-        init_queue_entries_empty(connections[client_id].request_queue, slot_count);
-        init_queue_entries_empty(connections[client_id].response_queue, slot_count);
+        init_notify_ring(connections[client_id].request_queue, slot_count);
+        init_notify_ring(connections[client_id].response_queue, slot_count);
     }
 
     {
@@ -1269,7 +1358,10 @@ main(int argc, char **argv)
                                                 slow_client_count,
                                                 slow_request_count,
                                                 total_request_target,
-                                                &breakdown,
+                                                request_payload_size,
+                                                response_payload_size,
+                                                response_transfer_mode,
+                                                &timing,
                                                 server_cpu,
                                                 control);
             _exit(child_rc == 0 ? 0 : 1);
@@ -1297,12 +1389,13 @@ main(int argc, char **argv)
                                                 request_count,
                                                 slow_client_count,
                                                 slow_request_count,
+                                                request_payload_size,
+                                                response_payload_size,
                                                 send_mode,
                                                 send_gap_ns,
                                                 slow_send_gap_ns,
-                                                &breakdown,
-                                                start_ns,
-                                                end_ns,
+                                                request_transfer_mode,
+                                                &timing,
                                                 control);
             _exit(child_rc == 0 ? 0 : 1);
         }
@@ -1312,7 +1405,6 @@ main(int argc, char **argv)
     while (!control_has_error(control) &&
            __atomic_load_n((const uint64_t *)&control->ready_count,
                            __ATOMIC_ACQUIRE) < client_count + 1) {
-        cpu_relax();
     }
 
     if (control_has_error(control)) {
@@ -1359,9 +1451,7 @@ wait_children:
                           request_count,
                           slow_client_count,
                           slow_request_count,
-                          &breakdown,
-                          start_ns,
-                          end_ns);
+                          &timing);
 
 cleanup:
     if (connections != NULL) {
@@ -1387,25 +1477,34 @@ cleanup:
 
     if (control != NULL)
         munmap((void *)control, shared_mapping_size(sizeof(*control)));
-    if (start_ns != NULL)
-        munmap((void *)start_ns, shared_mapping_size(sizeof(*start_ns) * total_requests));
-    if (end_ns != NULL)
-        munmap((void *)end_ns, shared_mapping_size(sizeof(*end_ns) * total_requests));
-    if (breakdown.request_publish_ns != NULL) {
-        munmap((void *)breakdown.request_publish_ns,
-               shared_mapping_size(sizeof(*breakdown.request_publish_ns) * total_requests));
+    if (timing.client_req_start_ts_ns != NULL) {
+        munmap((void *)timing.client_req_start_ts_ns,
+               shared_mapping_size(sizeof(*timing.client_req_start_ts_ns) *
+                                   total_requests));
     }
-    if (breakdown.server_observe_ns != NULL) {
-        munmap((void *)breakdown.server_observe_ns,
-               shared_mapping_size(sizeof(*breakdown.server_observe_ns) * total_requests));
+    if (timing.client_resp_done_ts_ns != NULL) {
+        munmap((void *)timing.client_resp_done_ts_ns,
+               shared_mapping_size(sizeof(*timing.client_resp_done_ts_ns) *
+                                   total_requests));
     }
-    if (breakdown.response_publish_ns != NULL) {
-        munmap((void *)breakdown.response_publish_ns,
-               shared_mapping_size(sizeof(*breakdown.response_publish_ns) * total_requests));
+    if (timing.server_req_observe_ts_ns != NULL) {
+        munmap((void *)timing.server_req_observe_ts_ns,
+               shared_mapping_size(sizeof(*timing.server_req_observe_ts_ns) *
+                                   total_requests));
     }
-    if (breakdown.response_observe_ns != NULL) {
-        munmap((void *)breakdown.response_observe_ns,
-               shared_mapping_size(sizeof(*breakdown.response_observe_ns) * total_requests));
+    if (timing.server_exec_done_ts_ns != NULL) {
+        munmap((void *)timing.server_exec_done_ts_ns,
+               shared_mapping_size(sizeof(*timing.server_exec_done_ts_ns) *
+                                   total_requests));
+    }
+    if (timing.server_resp_done_ts_ns != NULL) {
+        munmap((void *)timing.server_resp_done_ts_ns,
+               shared_mapping_size(sizeof(*timing.server_resp_done_ts_ns) *
+                                   total_requests));
+    }
+    if (timing.server_loop_start_ts_ns != NULL) {
+        munmap((void *)timing.server_loop_start_ts_ns,
+               shared_mapping_size(sizeof(*timing.server_loop_start_ts_ns)));
     }
 
     free(connections);

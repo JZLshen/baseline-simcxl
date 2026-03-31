@@ -36,6 +36,31 @@ SLOW30_LOGS = {
 OUTDIR = ROOT / "output" / "figures"
 
 
+def request_rows_from_log(log_path: Path):
+    parsed = parse_log(log_path)
+    rows = []
+
+    for (client_id, req_id), entry in parsed["timing_by_request"].items():
+        start_ns = entry.get("client_req_start_ts_ns", 0)
+        end_ns = entry.get("client_resp_done_ts_ns", 0)
+
+        if start_ns == 0 or end_ns == 0:
+            continue
+
+        rows.append(
+            {
+                "client_id": client_id,
+                "req_id": req_id,
+                "start_ns": start_ns,
+                "end_ns": end_ns,
+                "latency_ns": end_ns - start_ns,
+            }
+        )
+
+    rows.sort(key=lambda row: (row["client_id"], row["req_id"]))
+    return rows
+
+
 def output_paths(drop_first_per_client: int, paper: bool = False):
     if drop_first_per_client == 1:
         suffix = ""
@@ -51,7 +76,9 @@ def output_paths(drop_first_per_client: int, paper: bool = False):
 def build_rows_from_logs(label: str, log_map: dict, drop_first_per_client: int):
     rows = []
     for slow_client_count, log_path in sorted(log_map.items()):
-        _, request_rows, _ = parse_log(log_path)
+        if not log_path.exists():
+            continue
+        request_rows = request_rows_from_log(log_path)
         steady_stats = compute_steady_stats(request_rows, drop_first_per_client)
         rows.append(
             {
@@ -65,7 +92,10 @@ def build_rows_from_logs(label: str, log_map: dict, drop_first_per_client: int):
 
 
 def build_baseline_rows(drop_first_per_client: int):
-    _, request_rows, _ = parse_log(BASELINE_LOG)
+    if not BASELINE_LOG.exists():
+        return []
+
+    request_rows = request_rows_from_log(BASELINE_LOG)
     steady_stats = compute_steady_stats(request_rows, drop_first_per_client)
     return [
         {
@@ -376,6 +406,18 @@ def build_svg(series_rows, drop_first_per_client: int, paper: bool = False):
     return "\n".join(parts) + "\n"
 
 
+def build_empty_svg(message: str):
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="720" height="160" '
+        'viewBox="0 0 720 160" role="img" aria-label="HydraRPC slowmix steady compare unavailable">\n'
+        '<rect x="0" y="0" width="720" height="160" fill="#ffffff"/>\n'
+        '<text x="360" y="86" text-anchor="middle" '
+        'style="font-family:Times New Roman,serif;font-size:24px;fill:#1f2937">'
+        f"{message}</text>\n"
+        "</svg>\n"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--drop-first-per-client", type=int, default=1)
@@ -405,10 +447,16 @@ def main():
             for row in series_rows[label]:
                 writer.writerow(row)
 
-    outsvg.write_text(
-        build_svg(series_rows, args.drop_first_per_client, paper=args.paper),
-        encoding="utf-8",
-    )
+    if not baseline_rows:
+        outsvg.write_text(
+            build_empty_svg("Slowmix baseline log unavailable"),
+            encoding="utf-8",
+        )
+    else:
+        outsvg.write_text(
+            build_svg(series_rows, args.drop_first_per_client, paper=args.paper),
+            encoding="utf-8",
+        )
 
     print(f"wrote {outcsv}")
     print(f"wrote {outsvg}")
