@@ -1,18 +1,18 @@
 # Baseline Experiment Plan
 
 This file records the agreed baseline-only experiment set under
-`/home/wq/sh/backup/baseline-simcxl-export`.
+`/home/wq/sh/backup/baseline-simcxl`.
 
 ## Top-Level Driver
 
 Use the top-level driver below to submit the agreed baseline min-set:
 
-- [tools/run_hydrarpc_baseline_minset.sh](/home/wq/sh/backup/baseline-simcxl-export/tools/run_hydrarpc_baseline_minset.sh)
+- [tools/run_hydrarpc_baseline_minset.sh](/home/wq/sh/backup/baseline-simcxl/tools/run_hydrarpc_baseline_minset.sh)
 
 Examples:
 
 ```bash
-cd /home/wq/sh/backup/baseline-simcxl-export
+cd /home/wq/sh/backup/baseline-simcxl
 
 # show the full expanded command list only
 bash tools/run_hydrarpc_baseline_minset.sh --dry-run
@@ -55,11 +55,11 @@ The top-level driver performs:
 ## Runner Mapping
 
 - non-coherent dedicated/shared:
-  - [tools/run_hydrarpc_sweep.sh](/home/wq/sh/backup/baseline-simcxl-export/tools/run_hydrarpc_sweep.sh)
+  - [tools/run_hydrarpc_sweep.sh](/home/wq/sh/backup/baseline-simcxl/tools/run_hydrarpc_sweep.sh)
 - coherent dedicated:
-  - [tools/run_hydrarpc_coherent_sweep.sh](/home/wq/sh/backup/baseline-simcxl-export/tools/run_hydrarpc_coherent_sweep.sh)
+  - [tools/run_hydrarpc_coherent_sweep.sh](/home/wq/sh/backup/baseline-simcxl/tools/run_hydrarpc_coherent_sweep.sh)
 - legacy 16-client slowmix helper:
-  - [tools/run_hydrarpc_16client_slowmix_sweep.sh](/home/wq/sh/backup/baseline-simcxl-export/tools/run_hydrarpc_16client_slowmix_sweep.sh)
+  - [tools/run_hydrarpc_16client_slowmix_sweep.sh](/home/wq/sh/backup/baseline-simcxl/tools/run_hydrarpc_16client_slowmix_sweep.sh)
   - not part of the current paper run list
 
 ## Minimal New-Run Set
