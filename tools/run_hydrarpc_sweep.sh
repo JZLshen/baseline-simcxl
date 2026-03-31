@@ -440,14 +440,14 @@ process_one() {
     echo "[$(date '+%F %T')] RUN-FAIL kind=${kind} client_count=${client_count} rc=${runner_rc} outdir=${outdir}" \
       | tee -a "$RUN_LOG"
     record_failure "$kind" "$client_count" "$runner_rc" "$outdir" "runner_failed"
-    return 0
+    return 1
   fi
 
   if ! log_path="$(resolve_log_path "$kind" "$outdir")"; then
     echo "[$(date '+%F %T')] MISSING-LOG kind=${kind} client_count=${client_count} outdir=${outdir}" \
       | tee -a "$RUN_LOG"
     record_failure "$kind" "$client_count" "1" "$outdir" "missing_result_or_board_log"
-    return 0
+    return 1
   fi
 
   expected_total_requests=$((client_count * COUNT_PER_CLIENT))
@@ -478,12 +478,31 @@ process_one() {
       | tee -a "$RUN_LOG"
     printf '%s\n' "$summary_text" | tee -a "$RUN_LOG"
     record_failure "$kind" "$client_count" "$summary_rc" "$outdir" "summary_failed"
-    return 0
+    return 1
   fi
 
   printf '%s\n' "$summary_text" | tee -a "$RUN_LOG"
   echo "[$(date '+%F %T')] END kind=${kind} client_count=${client_count} outdir=${outdir}" \
     | tee -a "$RUN_LOG"
+
+  return 0
+}
+
+wait_for_background_or_fail() {
+  local wait_rc=0
+
+  set +e
+  wait -n
+  wait_rc=$?
+  set -e
+
+  if [[ "$wait_rc" -ne 0 ]]; then
+    jobs -pr | xargs -r kill 2>/dev/null || true
+    wait || true
+    echo "[$(date '+%F %T')] FAIL-FAST aborting sweep after background failure" \
+      | tee -a "$RUN_LOG"
+    exit "$wait_rc"
+  fi
 }
 
 if [[ "$PARALLEL_JOBS" -gt 1 ]]; then
@@ -491,11 +510,13 @@ if [[ "$PARALLEL_JOBS" -gt 1 ]]; then
     for kind in $KINDS; do
       run_and_process_one "$kind" "$client_count" &
       while [[ "$(jobs -pr | wc -l)" -ge "$PARALLEL_JOBS" ]]; do
-        wait -n
+        wait_for_background_or_fail
       done
     done
   done
-  wait
+  while [[ "$(jobs -pr | wc -l)" -gt 0 ]]; do
+    wait_for_background_or_fail
+  done
 else
   for client_count in $CLIENT_COUNTS; do
     if [[ "$PARALLEL_PAIR" -eq 1 ]]; then

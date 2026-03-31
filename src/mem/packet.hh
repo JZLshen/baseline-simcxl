@@ -47,6 +47,7 @@
 #ifndef __MEM_PACKET_HH__
 #define __MEM_PACKET_HH__
 
+#include <atomic>
 #include <bitset>
 #include <cassert>
 #include <initializer_list>
@@ -385,6 +386,17 @@ class Packet : public Printable, public Extensible<Packet>
 
     /// A pointer to the original request.
     RequestPtr req;
+
+  private:
+    static PacketId
+    nextPacketId()
+    {
+        // Packet ids are used to pair related CMO packets. The default
+        // constructor path therefore needs a real unique transaction id
+        // instead of reusing the Request object's address.
+        static std::atomic<PacketId> next_id{1};
+        return next_id.fetch_add(1, std::memory_order_relaxed);
+    }
 
   private:
    /**
@@ -884,7 +896,7 @@ class Packet : public Printable, public Extensible<Packet>
      * not be valid. The command must be supplied.
      */
     Packet(const RequestPtr &_req, MemCmd _cmd)
-        :  cmd(_cmd), id((PacketId)_req.get()), req(_req),
+        :  cmd(_cmd), id(nextPacketId()), req(_req),
            data(nullptr), addr(0), _isSecure(false), size(0),
            _qosValue(0),
            htmReturnReason(HtmCacheFailure::NO_FAIL),
@@ -925,7 +937,7 @@ class Packet : public Printable, public Extensible<Packet>
      * req.  this allows for overriding the size/addr of the req.
      */
     Packet(const RequestPtr &_req, MemCmd _cmd, int _blkSize, PacketId _id = 0)
-        :  cmd(_cmd), id(_id ? _id : (PacketId)_req.get()), req(_req),
+        :  cmd(_cmd), id(_id ? _id : nextPacketId()), req(_req),
            data(nullptr), addr(0), _isSecure(false),
            _qosValue(0),
            htmReturnReason(HtmCacheFailure::NO_FAIL),
