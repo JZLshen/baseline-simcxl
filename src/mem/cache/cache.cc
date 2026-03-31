@@ -1115,7 +1115,8 @@ Cache::handleSnoop(PacketPtr pkt, CacheBlk *blk, bool is_timing,
     bool respond = false;
     bool blk_valid = blk && blk->isValid();
     if (pkt->isClean()) {
-        if (blk_valid && blk->isSet(CacheBlk::DirtyBit)) {
+        if (blk_valid && blk->isSet(CacheBlk::DirtyBit) &&
+            !pkt->satisfied()) {
             DPRINTF(CacheVerbose, "%s: packet (snoop) %s found block: %s\n",
                     __func__, pkt->print(), blk->print());
             PacketPtr wb_pkt =
