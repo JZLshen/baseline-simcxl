@@ -7,7 +7,7 @@ This file records the agreed baseline-only experiment set under
 
 Use the top-level driver below to submit the agreed baseline min-set:
 
-- [tools/run_baseline_paper_minset.sh](/home/wq/sh/backup/baseline-simcxl-export/tools/run_baseline_paper_minset.sh)
+- [tools/run_hydrarpc_baseline_minset.sh](/home/wq/sh/backup/baseline-simcxl-export/tools/run_hydrarpc_baseline_minset.sh)
 
 Examples:
 
@@ -15,15 +15,15 @@ Examples:
 cd /home/wq/sh/backup/baseline-simcxl-export
 
 # show the full expanded command list only
-bash tools/run_baseline_paper_minset.sh --dry-run
+bash tools/run_hydrarpc_baseline_minset.sh --dry-run
 
 # run the whole agreed min-set
-bash tools/run_baseline_paper_minset.sh \
+bash tools/run_hydrarpc_baseline_minset.sh \
   --root-outdir output/paper_baseline_minset_run \
   --parallel-jobs 1
 
 # run only a subset of groups
-bash tools/run_baseline_paper_minset.sh \
+bash tools/run_hydrarpc_baseline_minset.sh \
   --groups "overall coherence" \
   --root-outdir output/paper_baseline_overall_coherence
 ```
@@ -55,16 +55,35 @@ The top-level driver performs:
 ## Runner Mapping
 
 - non-coherent dedicated/shared:
-  - [tools/run_hydrarpc_multiclient_sweep.sh](/home/wq/sh/backup/baseline-simcxl-export/tools/run_hydrarpc_multiclient_sweep.sh)
+  - [tools/run_hydrarpc_sweep.sh](/home/wq/sh/backup/baseline-simcxl-export/tools/run_hydrarpc_sweep.sh)
 - coherent dedicated:
-  - [tools/run_hydrarpc_multiclient_coherent_sweep.sh](/home/wq/sh/backup/baseline-simcxl-export/tools/run_hydrarpc_multiclient_coherent_sweep.sh)
+  - [tools/run_hydrarpc_coherent_sweep.sh](/home/wq/sh/backup/baseline-simcxl-export/tools/run_hydrarpc_coherent_sweep.sh)
 - legacy 16-client slowmix helper:
-  - [tools/run_hydrarpc_multiclient_16client_slowmix_sweep.sh](/home/wq/sh/backup/baseline-simcxl-export/tools/run_hydrarpc_multiclient_16client_slowmix_sweep.sh)
+  - [tools/run_hydrarpc_16client_slowmix_sweep.sh](/home/wq/sh/backup/baseline-simcxl-export/tools/run_hydrarpc_16client_slowmix_sweep.sh)
   - not part of the current paper run list
 
 ## Minimal New-Run Set
 
 Total new runs under the current agreed scope: `116`
+
+## Redundancy Review
+
+Strict reuse has already been applied to the current `116`-run set:
+
+- dropped the `3`-client point
+- dropped the whole `slow16` family
+- reused sparse `0%` from the corresponding non-slow baseline runs
+- reused `req=64, resp=64, c32` in both request-size and response-size sensitivity
+- reused `slot-count=1024` in ring-size sensitivity
+- reused non-coherent dedicated `staging/staging` from `overall req64/resp64 dedicated`
+
+Under the current agreed paper scope, there are no more strictly duplicate runs left.
+
+If runtime must be reduced further, the next cuts are no longer pure deduplication.
+They are scope cuts, in this order:
+
+- first cut: remove the `shared` half of `sparse32` because the strongest motivation signal there is still the dedicated polling path
+- second cut: remove the `shared` half of the `c32` request-size / response-size / ring-size sensitivity sweeps if those sections are reframed as dedicated-path sensitivity only
 
 ### 1. Overall Bare RPC
 
@@ -84,7 +103,7 @@ Workloads:
 Command templates:
 
 ```bash
-bash tools/run_hydrarpc_multiclient_sweep.sh \
+bash tools/run_hydrarpc_sweep.sh \
   --root-outdir output/paper_overall_req64_resp64 \
   --kinds "dedicated shared" \
   --client-counts "1 2 4 8 16 32" \
@@ -95,7 +114,7 @@ bash tools/run_hydrarpc_multiclient_sweep.sh \
 ```
 
 ```bash
-bash tools/run_hydrarpc_multiclient_sweep.sh \
+bash tools/run_hydrarpc_sweep.sh \
   --root-outdir output/paper_overall_req1530_resp315 \
   --kinds "dedicated shared" \
   --client-counts "1 2 4 8 16 32" \
@@ -106,7 +125,7 @@ bash tools/run_hydrarpc_multiclient_sweep.sh \
 ```
 
 ```bash
-bash tools/run_hydrarpc_multiclient_sweep.sh \
+bash tools/run_hydrarpc_sweep.sh \
   --root-outdir output/paper_overall_req38_resp230 \
   --kinds "dedicated shared" \
   --client-counts "1 2 4 8 16 32" \
@@ -137,7 +156,7 @@ The non-coherent dedicated `staging/staging` series is reused from
 Command templates:
 
 ```bash
-bash tools/run_hydrarpc_multiclient_sweep.sh \
+bash tools/run_hydrarpc_sweep.sh \
   --root-outdir output/paper_coherence_noncc_direct \
   --kinds "dedicated" \
   --client-counts "1 2 4 8 16 32" \
@@ -150,7 +169,7 @@ bash tools/run_hydrarpc_multiclient_sweep.sh \
 ```
 
 ```bash
-bash tools/run_hydrarpc_multiclient_coherent_sweep.sh \
+bash tools/run_hydrarpc_coherent_sweep.sh \
   --root-outdir output/paper_coherence_cc_direct \
   --client-counts "1 2 4 8 16 32" \
   --count-per-client 30 \
@@ -257,7 +276,7 @@ Equivalent meanings:
 Command template pattern:
 
 ```bash
-bash tools/run_hydrarpc_multiclient_sweep.sh \
+bash tools/run_hydrarpc_sweep.sh \
   --root-outdir output/paper_sparse32_pct25 \
   --kinds "dedicated shared" \
   --client-counts "32" \

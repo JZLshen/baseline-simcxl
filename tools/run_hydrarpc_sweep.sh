@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  tools/run_hydrarpc_multiclient_sweep.sh [options]
+  tools/run_hydrarpc_sweep.sh [options]
 
 Options:
   --root-outdir <dir>      Root output directory.
@@ -173,7 +173,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "$REPO_ROOT"
 
 if [[ -z "$ROOT_OUTDIR" ]]; then
-  ROOT_OUTDIR="output/hydrarpc_multiclient_sweep_$(date +%Y%m%d_%H%M%S)"
+  ROOT_OUTDIR="output/hydrarpc_dedicated_shared_sweep_$(date +%Y%m%d_%H%M%S)"
 fi
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
@@ -183,18 +183,18 @@ fi
 if [[ "$KINDS" == *"dedicated"* && "$SKIP_IMAGE_SETUP" -eq 0 ]]; then
   if [[ -n "$GUEST_CFLAGS" ]]; then
     HYDRARPC_GUEST_CFLAGS="$GUEST_CFLAGS" \
-      bash tools/setup_hydrarpc_multiclient_dedicated_disk_image.sh files/parsec.img
+      bash tools/setup_hydrarpc_dedicated_disk_image.sh files/parsec.img
   else
-    bash tools/setup_hydrarpc_multiclient_dedicated_disk_image.sh files/parsec.img
+    bash tools/setup_hydrarpc_dedicated_disk_image.sh files/parsec.img
   fi
 fi
 
 if [[ "$KINDS" == *"shared"* && "$SKIP_IMAGE_SETUP" -eq 0 ]]; then
   if [[ -n "$GUEST_CFLAGS" ]]; then
     HYDRARPC_GUEST_CFLAGS="$GUEST_CFLAGS" \
-      bash tools/setup_hydrarpc_multiclient_shared_disk_image.sh files/parsec.img
+      bash tools/setup_hydrarpc_shared_disk_image.sh files/parsec.img
   else
-    bash tools/setup_hydrarpc_multiclient_shared_disk_image.sh files/parsec.img
+    bash tools/setup_hydrarpc_shared_disk_image.sh files/parsec.img
   fi
 fi
 
@@ -235,10 +235,10 @@ resolve_log_path() {
 
   case "$kind" in
     dedicated)
-      result_log="$outdir/hydrarpc_multiclient_dedicated.result.log"
+      result_log="$outdir/hydrarpc_dedicated.result.log"
       ;;
     shared)
-      result_log="$outdir/hydrarpc_multiclient_shared.result.log"
+      result_log="$outdir/hydrarpc_shared.result.log"
       ;;
     *)
       return 1
@@ -283,8 +283,8 @@ is_transient_cpu_failure() {
   rg -q \
     "need online cpus > max\\(server-cpu, client-count-1\\)|failed to pin server to cpu|failed to pin client" \
     "$outdir/board.pc.com_1.device" \
-    "$outdir/hydrarpc_multiclient_shared.result.log" \
-    "$outdir/hydrarpc_multiclient_dedicated.result.log" \
+    "$outdir/hydrarpc_shared.result.log" \
+    "$outdir/hydrarpc_dedicated.result.log" \
     2>/dev/null
 }
 
@@ -305,10 +305,10 @@ run_runner_only() {
   runner_rc_file="$outdir/runner.exitcode"
   case "$kind" in
     dedicated)
-      runner="tools/run_e2e_hydrarpc_multiclient_dedicated.sh"
+      runner="tools/run_e2e_hydrarpc_dedicated.sh"
       ;;
     shared)
-      runner="tools/run_e2e_hydrarpc_multiclient_shared.sh"
+      runner="tools/run_e2e_hydrarpc_shared.sh"
       ;;
     *)
       echo "unknown kind: $kind" >&2
@@ -421,10 +421,10 @@ process_one() {
   runner_rc_file="$outdir/runner.exitcode"
   case "$kind" in
     dedicated)
-      experiment="multiclient_dedicated"
+      experiment="dedicated"
       ;;
     shared)
-      experiment="multiclient_shared"
+      experiment="shared"
       ;;
     *)
       echo "unknown kind: $kind" >&2

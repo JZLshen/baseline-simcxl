@@ -1,9 +1,9 @@
 #if !defined(HYDRARPC_VARIANT_NAME)
-#error "HYDRARPC_VARIANT_NAME must be defined before including hydrarpc_multiclient_dedicated_impl.inc"
+#error "HYDRARPC_VARIANT_NAME must be defined before including hydrarpc_dedicated_impl.inc"
 #endif
 
 #if !defined(HYDRARPC_COHERENT)
-#error "HYDRARPC_COHERENT must be defined before including hydrarpc_multiclient_dedicated_impl.inc"
+#error "HYDRARPC_COHERENT must be defined before including hydrarpc_dedicated_impl.inc"
 #endif
 
 #define _GNU_SOURCE

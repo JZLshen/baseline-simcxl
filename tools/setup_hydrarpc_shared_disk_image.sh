@@ -4,9 +4,9 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  tools/setup_hydrarpc_multiclient_dedicated_disk_image.sh <disk-image>
+  tools/setup_hydrarpc_shared_disk_image.sh <disk-image>
 
-Build the dedicated multi-client hydrarpc guest binary on the host, then
+Build the shared multi-client hydrarpc guest binary on the host, then
 inject the binary and a small guest-side wrapper into the disk image.
 
 Environment:
@@ -20,22 +20,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 DISK_IMAGE="${1:-}"
-SOURCE="${REPO_ROOT}/tools/hydrarpc_multiclient_dedicated.c"
-BUILD_DIR="${REPO_ROOT}/output/hydrarpc_multiclient_dedicated_guest"
-BINARY_NAME="hydrarpc_multiclient_dedicated"
+SOURCE="${REPO_ROOT}/tools/hydrarpc_shared.c"
+BUILD_DIR="${REPO_ROOT}/output/hydrarpc_shared_guest"
+BINARY_NAME="hydrarpc_shared"
 HOST_BINARY="${BUILD_DIR}/${BINARY_NAME}"
 GEM5_INCLUDE_DIR="${REPO_ROOT}/include"
 M5OPS_SOURCE="${REPO_ROOT}/util/m5/src/abi/x86/m5op.S"
 GUEST_DEST_DIR="/home/test_code"
 GUEST_BINARY="${GUEST_DEST_DIR}/${BINARY_NAME}"
 GUEST_WRAPPER="${GUEST_DEST_DIR}/run_${BINARY_NAME}.sh"
-LEGACY_GUEST_BINARY="${GUEST_DEST_DIR}/hydrarpc_multiclient_dedicated_send1_poll1"
-LEGACY_GUEST_WRAPPER="${GUEST_DEST_DIR}/run_hydrarpc_multiclient_dedicated_send1_poll1.sh"
-LEGACY_GUEST_WORKDIR="/root/hydrarpc"
-ROOT_BASHRC="/root/.bashrc"
+LEGACY_GUEST_BINARY="${GUEST_DEST_DIR}/hydrarpc_multiclient_shared_send1_poll1"
+LEGACY_GUEST_WRAPPER="${GUEST_DEST_DIR}/run_hydrarpc_multiclient_shared_send1_poll1.sh"
 CC_BIN="${CC:-gcc}"
 GUEST_CFLAGS="${HYDRARPC_GUEST_CFLAGS:--O2 -Wall -static -g -pthread}"
-MOUNT_POINT="/tmp/hydrarpc_dedicated_disk_$$"
+MOUNT_POINT="/tmp/hydrarpc_shared_disk_$$"
 LOOP_DEVICE=""
 
 cleanup() {
@@ -44,33 +42,6 @@ cleanup() {
     sudo losetup -d "${LOOP_DEVICE}" >/dev/null 2>&1 || true
   fi
   rmdir "${MOUNT_POINT}" >/dev/null 2>&1 || true
-}
-
-strip_legacy_bootstrap_from_bashrc() {
-  local mounted_bashrc="${MOUNT_POINT}${ROOT_BASHRC}"
-
-  if [[ ! -f "${mounted_bashrc}" ]]; then
-    return 0
-  fi
-
-  sudo sed -i \
-    '/^# hydrarpc local bootstrap$/,/^fi$/d' \
-    "${mounted_bashrc}"
-}
-
-cleanup_legacy_dedicated_guest_artifacts() {
-  local mounted_workdir="${MOUNT_POINT}${LEGACY_GUEST_WORKDIR}"
-
-  sudo rm -f \
-    "${MOUNT_POINT}${LEGACY_GUEST_BINARY}" \
-    "${MOUNT_POINT}${LEGACY_GUEST_WRAPPER}" \
-    "${mounted_workdir}/hydrarpc_autorun.env" \
-    "${mounted_workdir}/hydrarpc_multiclient_dedicated_bootstrap.sh" \
-    "${mounted_workdir}/hydrarpc_multiclient_dedicated_guest_runner.sh" \
-    "${mounted_workdir}/hydrarpc_multiclient_dedicated_send1_poll1.c" \
-    "${mounted_workdir}/hydrarpc_multiclient_dedicated_send1_poll1"
-  sudo rmdir "${mounted_workdir}" >/dev/null 2>&1 || true
-  strip_legacy_bootstrap_from_bashrc
 }
 
 if [[ -z "${DISK_IMAGE}" || "${DISK_IMAGE}" == "--help" || "${DISK_IMAGE}" == "-h" ]]; then
@@ -140,16 +111,17 @@ if ! sudo mount -o loop "${DISK_IMAGE}" "${MOUNT_POINT}" 2>/dev/null; then
   sudo mount "${LOOP_PARTITION}" "${MOUNT_POINT}"
 fi
 
-cleanup_legacy_dedicated_guest_artifacts
-
 sudo mkdir -p "${MOUNT_POINT}${GUEST_DEST_DIR}"
+sudo rm -f \
+  "${MOUNT_POINT}${LEGACY_GUEST_BINARY}" \
+  "${MOUNT_POINT}${LEGACY_GUEST_WRAPPER}"
 sudo install -m 0755 "${HOST_BINARY}" "${MOUNT_POINT}${GUEST_BINARY}"
 
 WRAPPER_TMP="$(mktemp)"
 cat > "${WRAPPER_TMP}" <<'EOF'
 #!/bin/sh
 set -eu
-exec numactl -N 0 -m 0 /home/test_code/hydrarpc_multiclient_dedicated "$@"
+exec numactl -N 0 -m 0 /home/test_code/hydrarpc_shared "$@"
 EOF
 sudo install -m 0755 "${WRAPPER_TMP}" "${MOUNT_POINT}${GUEST_WRAPPER}"
 rm -f "${WRAPPER_TMP}"

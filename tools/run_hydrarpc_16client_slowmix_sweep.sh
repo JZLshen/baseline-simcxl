@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  tools/run_hydrarpc_multiclient_16client_slowmix_sweep.sh [options]
+  tools/run_hydrarpc_16client_slowmix_sweep.sh [options]
 
 Options:
   --outdir <dir>                Output root.
@@ -45,7 +45,7 @@ EOF
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-OUTDIR="output/hydrarpc_multiclient_16client_slowmix_$(date +%Y%m%d_%H%M%S)"
+OUTDIR="output/hydrarpc_slowmix16_sweep_$(date +%Y%m%d_%H%M%S)"
 BINARY="build/X86/gem5.opt"
 CPU_TYPE="TIMING"
 BOOT_CPU="KVM"
@@ -216,7 +216,7 @@ PY
   echo "[$(date '+%F %T')] START slow_client_count=${slow_client_count} outdir=${out}" | tee -a "$RUNLOG"
 
   set +e
-  bash "$REPO_ROOT/tools/run_e2e_hydrarpc_multiclient_dedicated.sh" \
+  bash "$REPO_ROOT/tools/run_e2e_hydrarpc_dedicated.sh" \
     --binary "$BINARY" \
     --cpu-type "$CPU_TYPE" \
     --boot-cpu "$BOOT_CPU" \
@@ -245,7 +245,7 @@ PY
 
   python3 "$REPO_ROOT/tools/summarize_hydrarpc_multiclient.py" \
     --log "$out/board.pc.com_1.device" \
-    --experiment multiclient_dedicated_slowmix \
+    --experiment dedicated_slowmix \
     --client-count "$CLIENT_COUNT" \
     --count-per-client "$COUNT_PER_CLIENT" \
     --expected-total-requests "$expected_total" \

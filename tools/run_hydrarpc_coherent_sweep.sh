@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  tools/run_hydrarpc_multiclient_coherent_sweep.sh [options]
+  tools/run_hydrarpc_coherent_sweep.sh [options]
 
 Options:
   --root-outdir <dir>      Root output directory.
@@ -161,7 +161,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "$REPO_ROOT"
 
 if [[ -z "$ROOT_OUTDIR" ]]; then
-  ROOT_OUTDIR="output/hydrarpc_multiclient_coherent_sweep_$(date +%Y%m%d_%H%M%S)"
+  ROOT_OUTDIR="output/hydrarpc_dedicated_coherent_sweep_$(date +%Y%m%d_%H%M%S)"
 fi
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
@@ -171,9 +171,9 @@ fi
 if [[ "$SKIP_IMAGE_SETUP" -eq 0 ]]; then
   if [[ -n "$GUEST_CFLAGS" ]]; then
     HYDRARPC_GUEST_CFLAGS="$GUEST_CFLAGS" \
-      bash tools/setup_hydrarpc_multiclient_dedicated_coherent_disk_image.sh files/parsec.img
+      bash tools/setup_hydrarpc_dedicated_coherent_disk_image.sh files/parsec.img
   else
-    bash tools/setup_hydrarpc_multiclient_dedicated_coherent_disk_image.sh files/parsec.img
+    bash tools/setup_hydrarpc_dedicated_coherent_disk_image.sh files/parsec.img
   fi
 fi
 
@@ -208,7 +208,7 @@ record_failure() {
 
 resolve_log_path() {
   local outdir="$1"
-  local result_log="$outdir/hydrarpc_multiclient_dedicated_coherent.result.log"
+  local result_log="$outdir/hydrarpc_dedicated_coherent.result.log"
 
   if [[ -f "$result_log" ]]; then
     printf '%s\n' "$result_log"
@@ -241,7 +241,7 @@ is_transient_cpu_failure() {
   rg -q \
     "need online cpus > max\\(server-cpu, client-count-1\\)|failed to pin server to cpu|failed to pin client" \
     "$outdir/board.pc.com_1.device" \
-    "$outdir/hydrarpc_multiclient_dedicated_coherent.result.log" \
+    "$outdir/hydrarpc_dedicated_coherent.result.log" \
     2>/dev/null
 }
 
@@ -321,7 +321,7 @@ run_runner_only() {
     fi
 
     set +e
-    bash tools/run_e2e_hydrarpc_multiclient_dedicated_coherent.sh \
+    bash tools/run_e2e_hydrarpc_dedicated_coherent.sh \
       --skip-build \
       --cpu-type "$CPU_TYPE" \
       --boot-cpu "$BOOT_CPU" \
@@ -401,7 +401,7 @@ process_one() {
   summary_text="$(
     python3 tools/summarize_hydrarpc_multiclient.py \
       --log "$log_path" \
-      --experiment multiclient_dedicated_coherent \
+      --experiment dedicated_coherent \
       --client-count "$client_count" \
       --count-per-client "$COUNT_PER_CLIENT" \
       --expected-total-requests "$expected_total_requests" \

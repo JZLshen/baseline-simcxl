@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  tools/run_e2e_hydrarpc_multiclient_dedicated.sh [options]
+  tools/run_e2e_hydrarpc_dedicated.sh [options]
 
 Options:
   --outdir <dir>           Output directory.
@@ -53,7 +53,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 KERNEL="${REPO_ROOT}/files/vmlinux"
 DISK_IMAGE="${REPO_ROOT}/files/parsec.img"
 
-OUTDIR="output/hydrarpc_multiclient_dedicated"
+OUTDIR="output/hydrarpc_dedicated_run"
 BINARY="build/X86/gem5.opt"
 CPU_TYPE="TIMING"
 BOOT_CPU="KVM"
@@ -256,11 +256,11 @@ fi
 
 if [[ "$SKIP_IMAGE_SETUP" -eq 0 ]]; then
   HYDRARPC_GUEST_CFLAGS="$GUEST_CFLAGS" \
-    bash tools/setup_hydrarpc_multiclient_dedicated_disk_image.sh "$DISK_IMAGE"
+    bash tools/setup_hydrarpc_dedicated_disk_image.sh "$DISK_IMAGE"
 fi
 
-GUEST_CMD="/home/test_code/run_hydrarpc_multiclient_dedicated.sh --client-count ${CLIENT_COUNT} --count-per-client ${COUNT_PER_CLIENT} --window-size ${WINDOW_SIZE} --slot-count ${SLOT_COUNT} --req-bytes ${REQ_BYTES} --resp-bytes ${RESP_BYTES} --slow-client-count ${SLOW_CLIENT_COUNT} --slow-count-per-client ${SLOW_COUNT_PER_CLIENT} --slow-send-gap-ns ${SLOW_SEND_GAP_NS} --send-mode ${SEND_MODE} --send-gap-ns ${SEND_GAP_NS} --request-transfer-mode ${REQUEST_TRANSFER_MODE} --response-transfer-mode ${RESPONSE_TRANSFER_MODE} --cxl-node ${CXL_NODE} --server-cpu ${SERVER_CPU}"
-WORKLOAD_FILE="$OUTDIR/hydrarpc_multiclient_dedicated.runscript"
+GUEST_CMD="/home/test_code/run_hydrarpc_dedicated.sh --client-count ${CLIENT_COUNT} --count-per-client ${COUNT_PER_CLIENT} --window-size ${WINDOW_SIZE} --slot-count ${SLOT_COUNT} --req-bytes ${REQ_BYTES} --resp-bytes ${RESP_BYTES} --slow-client-count ${SLOW_CLIENT_COUNT} --slow-count-per-client ${SLOW_COUNT_PER_CLIENT} --slow-send-gap-ns ${SLOW_SEND_GAP_NS} --send-mode ${SEND_MODE} --send-gap-ns ${SEND_GAP_NS} --request-transfer-mode ${REQUEST_TRANSFER_MODE} --response-transfer-mode ${RESPONSE_TRANSFER_MODE} --cxl-node ${CXL_NODE} --server-cpu ${SERVER_CPU}"
+WORKLOAD_FILE="$OUTDIR/hydrarpc_dedicated.runscript"
 
 {
   printf "#!/bin/sh\n"
@@ -309,7 +309,7 @@ echo
 echo "=== Multi-client dedicated summary ==="
 python3 tools/summarize_hydrarpc_multiclient.py \
   --log "$LOG_PATH" \
-  --experiment multiclient_dedicated \
+  --experiment dedicated \
   --client-count "$CLIENT_COUNT" \
   --count-per-client "$COUNT_PER_CLIENT" \
   --expected-total-requests "$EXPECTED_TOTAL_REQUESTS"

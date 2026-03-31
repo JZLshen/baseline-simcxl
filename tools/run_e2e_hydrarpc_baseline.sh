@@ -7,7 +7,7 @@ Usage:
   tools/run_e2e_hydrarpc_baseline.sh [options]
 
 Options:
-  --outdir <dir>        Output directory. Default: output/hydrarpc_baseline_w0_r1
+  --outdir <dir>        Output directory. Default: output/hydrarpc_baseline_single_w0_r1
   --binary <path>       gem5 binary. Default: build/X86/gem5.opt
   --cpu-type <type>     Switch CPU type: TIMING or O3. Default: TIMING
   --boot-cpu <type>     Boot CPU type: KVM or ATOMIC. Default: KVM
@@ -34,7 +34,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 KERNEL="${REPO_ROOT}/files/vmlinux"
 DISK_IMAGE="${REPO_ROOT}/files/parsec.img"
 
-OUTDIR="output/hydrarpc_baseline_w0_r1"
+OUTDIR="output/hydrarpc_baseline_single_w0_r1"
 BINARY="build/X86/gem5.opt"
 CPU_TYPE="TIMING"
 BOOT_CPU="KVM"

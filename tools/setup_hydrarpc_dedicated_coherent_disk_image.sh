@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  tools/setup_hydrarpc_multiclient_dedicated_coherent_disk_image.sh <disk-image>
+  tools/setup_hydrarpc_dedicated_coherent_disk_image.sh <disk-image>
 
 Build the coherent dedicated multi-client hydrarpc guest binary on the host,
 then inject the binary and a small guest-side wrapper into the disk image.
@@ -20,9 +20,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 DISK_IMAGE="${1:-}"
-SOURCE="${REPO_ROOT}/tools/hydrarpc_multiclient_dedicated_coherent.c"
-BUILD_DIR="${REPO_ROOT}/output/hydrarpc_multiclient_dedicated_coherent_guest"
-BINARY_NAME="hydrarpc_multiclient_dedicated_coherent"
+SOURCE="${REPO_ROOT}/tools/hydrarpc_dedicated_coherent.c"
+BUILD_DIR="${REPO_ROOT}/output/hydrarpc_dedicated_coherent_guest"
+BINARY_NAME="hydrarpc_dedicated_coherent"
 HOST_BINARY="${BUILD_DIR}/${BINARY_NAME}"
 GEM5_INCLUDE_DIR="${REPO_ROOT}/include"
 M5OPS_SOURCE="${REPO_ROOT}/util/m5/src/abi/x86/m5op.S"
@@ -149,7 +149,7 @@ WRAPPER_TMP="$(mktemp)"
 cat > "${WRAPPER_TMP}" <<'EOF'
 #!/bin/sh
 set -eu
-exec numactl -N 0 -m 0 /home/test_code/hydrarpc_multiclient_dedicated_coherent "$@"
+exec numactl -N 0 -m 0 /home/test_code/hydrarpc_dedicated_coherent "$@"
 EOF
 sudo install -m 0755 "${WRAPPER_TMP}" "${MOUNT_POINT}${GUEST_WRAPPER}"
 rm -f "${WRAPPER_TMP}"

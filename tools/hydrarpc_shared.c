@@ -1287,7 +1287,7 @@ main(int argc, char **argv)
 
     if (!cpu_has_clflushopt()) {
         fprintf(stderr,
-                "clflushopt is required for hydrarpc_multiclient_shared\n");
+                "clflushopt is required for hydrarpc_shared\n");
         return 2;
     }
 

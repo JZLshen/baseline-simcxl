@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  tools/run_baseline_paper_minset.sh [options]
+  tools/run_hydrarpc_baseline_minset.sh [options]
 
 Options:
   --root-outdir <dir>      Root output directory.
@@ -91,8 +91,8 @@ append_common_sweep_args() {
 run_overall_group() {
   local args=()
 
-  args=(bash tools/run_hydrarpc_multiclient_sweep.sh
-    --root-outdir "$ROOT_OUTDIR/overall_req64_resp64"
+  args=(bash tools/run_hydrarpc_sweep.sh
+    --root-outdir "$ROOT_OUTDIR/overall_dedicated_shared_req64_resp64_pow2"
     --kinds "dedicated shared"
     --client-counts "1 2 4 8 16 32"
     --req-bytes 64
@@ -101,8 +101,8 @@ run_overall_group() {
   append_common_sweep_args args
   run_cmd "${args[@]}"
 
-  args=(bash tools/run_hydrarpc_multiclient_sweep.sh
-    --root-outdir "$ROOT_OUTDIR/overall_req1530_resp315"
+  args=(bash tools/run_hydrarpc_sweep.sh
+    --root-outdir "$ROOT_OUTDIR/overall_dedicated_shared_req1530_resp315_pow2"
     --kinds "dedicated shared"
     --client-counts "1 2 4 8 16 32"
     --req-bytes 1530
@@ -111,8 +111,8 @@ run_overall_group() {
   append_common_sweep_args args
   run_cmd "${args[@]}"
 
-  args=(bash tools/run_hydrarpc_multiclient_sweep.sh
-    --root-outdir "$ROOT_OUTDIR/overall_req38_resp230"
+  args=(bash tools/run_hydrarpc_sweep.sh
+    --root-outdir "$ROOT_OUTDIR/overall_dedicated_shared_req38_resp230_pow2"
     --kinds "dedicated shared"
     --client-counts "1 2 4 8 16 32"
     --req-bytes 38
@@ -125,8 +125,8 @@ run_overall_group() {
 run_coherence_group() {
   local args=()
 
-  args=(bash tools/run_hydrarpc_multiclient_sweep.sh
-    --root-outdir "$ROOT_OUTDIR/coherence_noncc_direct"
+  args=(bash tools/run_hydrarpc_sweep.sh
+    --root-outdir "$ROOT_OUTDIR/coherence_dedicated_noncc_direct_req64_resp64_pow2"
     --kinds "dedicated"
     --client-counts "1 2 4 8 16 32"
     --req-bytes 64
@@ -137,8 +137,8 @@ run_coherence_group() {
   append_common_sweep_args args
   run_cmd "${args[@]}"
 
-  args=(bash tools/run_hydrarpc_multiclient_coherent_sweep.sh
-    --root-outdir "$ROOT_OUTDIR/coherence_cc_direct"
+  args=(bash tools/run_hydrarpc_coherent_sweep.sh
+    --root-outdir "$ROOT_OUTDIR/coherence_dedicated_cc_direct_req64_resp64_pow2"
     --client-counts "1 2 4 8 16 32"
     --req-bytes 64
     --resp-bytes 64
@@ -154,8 +154,8 @@ run_req_size_group() {
   local args=()
 
   for req_bytes in 8 256 1024 4096 8192; do
-    args=(bash tools/run_hydrarpc_multiclient_sweep.sh
-      --root-outdir "$ROOT_OUTDIR/reqsize_req${req_bytes}_resp64_c32"
+    args=(bash tools/run_hydrarpc_sweep.sh
+      --root-outdir "$ROOT_OUTDIR/reqsize_dedicated_shared_c32_req${req_bytes}_resp64"
       --kinds "dedicated shared"
       --client-counts "32"
       --req-bytes "$req_bytes"
@@ -171,8 +171,8 @@ run_resp_size_group() {
   local args=()
 
   for resp_bytes in 8 256 1024 4096 8192; do
-    args=(bash tools/run_hydrarpc_multiclient_sweep.sh
-      --root-outdir "$ROOT_OUTDIR/respsize_req64_resp${resp_bytes}_c32"
+    args=(bash tools/run_hydrarpc_sweep.sh
+      --root-outdir "$ROOT_OUTDIR/respsize_dedicated_shared_c32_req64_resp${resp_bytes}"
       --kinds "dedicated shared"
       --client-counts "32"
       --req-bytes 64
@@ -188,8 +188,8 @@ run_ring_size_group() {
   local args=()
 
   for ring_size in 16 32 64 128 256 512; do
-    args=(bash tools/run_hydrarpc_multiclient_sweep.sh
-      --root-outdir "$ROOT_OUTDIR/ringsize_s${ring_size}_req64_resp64_c32"
+    args=(bash tools/run_hydrarpc_sweep.sh
+      --root-outdir "$ROOT_OUTDIR/ringsize_dedicated_shared_c32_req64_resp64_s${ring_size}"
       --kinds "dedicated shared"
       --client-counts "32"
       --slot-count "$ring_size"
@@ -208,8 +208,8 @@ run_sparse32_group() {
 
   for slow_count_per_client in 8 15 30; do
     for slow_client_count in 4 8 16 20 24 28; do
-      args=(bash tools/run_hydrarpc_multiclient_sweep.sh
-        --root-outdir "$ROOT_OUTDIR/sparse32_sc${slow_client_count}_sq${slow_count_per_client}"
+      args=(bash tools/run_hydrarpc_sweep.sh
+        --root-outdir "$ROOT_OUTDIR/sparse32_dedicated_shared_c32_sc${slow_client_count}_sq${slow_count_per_client}"
         --kinds "dedicated shared"
         --client-counts "32"
         --req-bytes 64
@@ -294,7 +294,7 @@ group_enabled() {
 }
 
 if [[ -z "$ROOT_OUTDIR" ]]; then
-  ROOT_OUTDIR="output/paper_baseline_minset_$(date +%Y%m%d_%H%M%S)"
+  ROOT_OUTDIR="output/hydrarpc_baseline_minset_$(date +%Y%m%d_%H%M%S)"
 fi
 mkdir -p "$ROOT_OUTDIR"
 ROOT_OUTDIR="$(cd "$ROOT_OUTDIR" && pwd)"
@@ -310,9 +310,9 @@ if [[ "$SKIP_IMAGE_SETUP" -eq 0 ]]; then
      group_enabled ring-size || group_enabled sparse32 || group_enabled coherence; then
     if [[ -n "$GUEST_CFLAGS" ]]; then
       run_cmd env HYDRARPC_GUEST_CFLAGS="$GUEST_CFLAGS" \
-        bash tools/setup_hydrarpc_multiclient_dedicated_disk_image.sh files/parsec.img
+        bash tools/setup_hydrarpc_dedicated_disk_image.sh files/parsec.img
     else
-      run_cmd bash tools/setup_hydrarpc_multiclient_dedicated_disk_image.sh files/parsec.img
+      run_cmd bash tools/setup_hydrarpc_dedicated_disk_image.sh files/parsec.img
     fi
   fi
 
@@ -320,18 +320,18 @@ if [[ "$SKIP_IMAGE_SETUP" -eq 0 ]]; then
      group_enabled ring-size || group_enabled sparse32; then
     if [[ -n "$GUEST_CFLAGS" ]]; then
       run_cmd env HYDRARPC_GUEST_CFLAGS="$GUEST_CFLAGS" \
-        bash tools/setup_hydrarpc_multiclient_shared_disk_image.sh files/parsec.img
+        bash tools/setup_hydrarpc_shared_disk_image.sh files/parsec.img
     else
-      run_cmd bash tools/setup_hydrarpc_multiclient_shared_disk_image.sh files/parsec.img
+      run_cmd bash tools/setup_hydrarpc_shared_disk_image.sh files/parsec.img
     fi
   fi
 
   if group_enabled coherence; then
     if [[ -n "$GUEST_CFLAGS" ]]; then
       run_cmd env HYDRARPC_GUEST_CFLAGS="$GUEST_CFLAGS" \
-        bash tools/setup_hydrarpc_multiclient_dedicated_coherent_disk_image.sh files/parsec.img
+        bash tools/setup_hydrarpc_dedicated_coherent_disk_image.sh files/parsec.img
     else
-      run_cmd bash tools/setup_hydrarpc_multiclient_dedicated_coherent_disk_image.sh files/parsec.img
+      run_cmd bash tools/setup_hydrarpc_dedicated_coherent_disk_image.sh files/parsec.img
     fi
   fi
 fi
