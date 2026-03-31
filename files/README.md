@@ -2,9 +2,7 @@ Large local runtime artifacts are intentionally excluded from this repository sn
 
 Omitted files:
 - `files/parsec.img`
-- `files/parsec.img.bak`
 - `files/parsec copy.img`
-- `files/parsec copy.img.bak`
 - `files/vmlinux`
 
 If you need to run the full-system experiments, provide these artifacts locally under `files/`.

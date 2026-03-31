@@ -88,10 +88,6 @@ if [[ ! -x "${HOST_BINARY}" ]]; then
   exit 1
 fi
 
-if [[ ! -f "${DISK_IMAGE}.bak" ]]; then
-  cp "${DISK_IMAGE}" "${DISK_IMAGE}.bak"
-fi
-
 mkdir -p "${MOUNT_POINT}"
 trap cleanup EXIT
 
