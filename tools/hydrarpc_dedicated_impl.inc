@@ -557,6 +557,28 @@ fill_random_payload_bytes(uint8_t *dst, uint64_t payload_len, uint64_t *rng_stat
 }
 
 static void
+fill_random_payload_remote_and_shadow(uint8_t *remote_dst,
+                                      uint8_t *shadow_dst,
+                                      uint64_t payload_len,
+                                      uint64_t *rng_state)
+{
+    uint64_t offset = 0;
+
+    while (offset < payload_len) {
+        uint64_t word = next_rand(rng_state);
+        uint64_t chunk_len = min_u64(payload_len - offset, sizeof(word));
+
+        memcpy(remote_dst + offset, &word, (size_t)chunk_len);
+        memcpy(shadow_dst + offset, &word, (size_t)chunk_len);
+        offset += chunk_len;
+    }
+
+#if !HYDRARPC_COHERENT
+    flush_payload_remote_stores(remote_dst, payload_len);
+#endif
+}
+
+static void
 build_response_payload_bytes(uint8_t *dst,
                              uint64_t response_payload_size,
                              const uint8_t *request_bytes,
@@ -592,6 +614,26 @@ response_matches_request(const uint8_t *response_bytes,
 }
 
 static void
+store_response_payload_direct(uint8_t *remote_dst,
+                              uint64_t response_payload_size,
+                              const uint8_t *request_bytes,
+                              uint64_t request_payload_size)
+{
+    uint64_t copy_len = min_u64(response_payload_size, request_payload_size);
+
+    memcpy(remote_dst, request_bytes, (size_t)copy_len);
+    if (response_payload_size > copy_len) {
+        memset(remote_dst + copy_len,
+               0,
+               (size_t)(response_payload_size - copy_len));
+    }
+
+#if !HYDRARPC_COHERENT
+    flush_payload_remote_stores(remote_dst, response_payload_size);
+#endif
+}
+
+static void
 store_request_payload(uint8_t *remote_dst,
                       uint8_t *request_shadow,
                       uint64_t request_payload_size,
@@ -604,11 +646,10 @@ store_request_payload(uint8_t *remote_dst,
         return;
     }
 
-    fill_random_payload_bytes(request_shadow, request_payload_size, rng_state);
-    memcpy(remote_dst, request_shadow, (size_t)request_payload_size);
-#if !HYDRARPC_COHERENT
-    flush_payload_remote_stores(remote_dst, request_payload_size);
-#endif
+    fill_random_payload_remote_and_shadow(remote_dst,
+                                          request_shadow,
+                                          request_payload_size,
+                                          rng_state);
 }
 
 static void
@@ -619,19 +660,19 @@ store_response_payload(uint8_t *remote_dst,
                        enum TransferMode transfer_mode,
                        uint8_t *response_staging)
 {
-    build_response_payload_bytes(response_staging,
-                                 response_payload_size,
-                                 request_bytes,
-                                 request_payload_size);
     if (transfer_mode == TRANSFER_STAGING) {
+        build_response_payload_bytes(response_staging,
+                                     response_payload_size,
+                                     request_bytes,
+                                     request_payload_size);
         store_payload_remote(remote_dst, response_staging, response_payload_size);
         return;
     }
 
-    memcpy(remote_dst, response_staging, (size_t)response_payload_size);
-#if !HYDRARPC_COHERENT
-    flush_payload_remote_stores(remote_dst, response_payload_size);
-#endif
+    store_response_payload_direct(remote_dst,
+                                  response_payload_size,
+                                  request_bytes,
+                                  request_payload_size);
 }
 
 static int
@@ -655,10 +696,14 @@ run_server_dedicated(struct Connection *connections,
     uint64_t completed_total = 0;
     uint64_t next_client_hint = 0;
     uint8_t *request_payload_local = malloc((size_t)request_payload_size);
-    uint8_t *response_staging = malloc((size_t)response_payload_size);
+    uint8_t *response_staging = NULL;
+
+    if (response_transfer_mode == TRANSFER_STAGING)
+        response_staging = malloc((size_t)response_payload_size);
 
     if (next_seq == NULL || response_data_tail == NULL ||
-        request_payload_local == NULL || response_staging == NULL) {
+        request_payload_local == NULL ||
+        (response_transfer_mode == TRANSFER_STAGING && response_staging == NULL)) {
         fprintf(stderr, "server tracking allocation failed\n");
         set_control_error(control);
         free(next_seq);
