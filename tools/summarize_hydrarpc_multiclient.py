@@ -567,6 +567,21 @@ def fmt_optional_float(value, digits: int):
     return f"{value:.{digits}f}"
 
 
+def parse_extra_fields(raw_items):
+    extra = {}
+
+    for raw in raw_items or []:
+        if "=" not in raw:
+            raise ValueError(f"invalid --extra-field {raw!r}, expected KEY=VALUE")
+        key, value = raw.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(f"invalid --extra-field {raw!r}, empty key")
+        extra[key] = value
+
+    return extra
+
+
 def write_result_json(
     result_json_path: pathlib.Path,
     status: str,
@@ -576,6 +591,7 @@ def write_result_json(
     log_path: str,
     benchmark_rc,
     guest_command_rc,
+    extra_fields=None,
     stats=None,
     steady_stats=None,
     error=None,
@@ -589,6 +605,8 @@ def write_result_json(
         "benchmark_rc": benchmark_rc,
         "guest_command_rc": guest_command_rc,
     }
+    if extra_fields:
+        payload["extra_fields"] = dict(extra_fields)
     if stats is not None:
         payload["stats"] = stats
     if steady_stats is not None:
@@ -610,6 +628,7 @@ def record_failure_csv(
     outdir: str,
     log_path: str,
     reason: str,
+    extra_fields=None,
 ):
     fieldnames = [
         "experiment",
@@ -619,6 +638,8 @@ def record_failure_csv(
         "log_path",
         "reason",
     ]
+    if extra_fields:
+        fieldnames.extend(extra_fields.keys())
     append_csv_row(
         fail_csv_path,
         fieldnames,
@@ -629,6 +650,7 @@ def record_failure_csv(
             "outdir": outdir,
             "log_path": log_path,
             "reason": reason,
+            **(extra_fields or {}),
         },
     )
 
@@ -730,11 +752,17 @@ def parse_args():
     parser.add_argument("--fail-csv")
     parser.add_argument("--outdir", default="")
     parser.add_argument("--result-json")
+    parser.add_argument("--extra-field", action="append", default=[])
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    try:
+        extra_fields = parse_extra_fields(args.extra_field)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     log_path = pathlib.Path(args.log).resolve()
     parsed = parse_log(log_path)
 
@@ -760,6 +788,7 @@ def main():
                 args.outdir,
                 str(log_path),
                 reason,
+                extra_fields=extra_fields,
             )
         if args.result_json:
             write_result_json(
@@ -771,6 +800,7 @@ def main():
                 str(log_path),
                 benchmark_rc,
                 guest_command_rc,
+                extra_fields=extra_fields,
                 error=reason,
             )
         return 1
@@ -790,6 +820,7 @@ def main():
                 args.outdir,
                 str(log_path),
                 reason,
+                extra_fields=extra_fields,
             )
         if args.result_json:
             write_result_json(
@@ -801,6 +832,7 @@ def main():
                 str(log_path),
                 benchmark_rc,
                 guest_command_rc,
+                extra_fields=extra_fields,
                 error=reason,
             )
         return 1
@@ -832,6 +864,7 @@ def main():
                 args.outdir,
                 str(log_path),
                 validation_error,
+                extra_fields=extra_fields,
             )
         if args.result_json:
             write_result_json(
@@ -843,6 +876,7 @@ def main():
                 str(log_path),
                 benchmark_rc,
                 guest_command_rc,
+                extra_fields=extra_fields,
                 error=validation_error,
             )
         return 1
@@ -866,88 +900,96 @@ def main():
     print_summary(benchmark_rc, guest_command_rc, stats, steady_stats)
 
     if args.csv:
+        summary_fieldnames = [
+            "experiment",
+            "client_count",
+            "count_per_client",
+            "total_requests",
+            "first_start_ns",
+            "last_end_ns",
+            "total_e2e_ns",
+            "avg_latency_ns",
+            "median_latency_ns",
+            "p50_latency_ns",
+            "p99_latency_ns",
+            "aggregate_throughput_mrps",
+            "avg_server_poll_notify_ns",
+            "p50_server_poll_notify_ns",
+            "p99_server_poll_notify_ns",
+            "avg_server_execute_ns",
+            "p50_server_execute_ns",
+            "p99_server_execute_ns",
+            "avg_server_response_ns",
+            "p50_server_response_ns",
+            "p99_server_response_ns",
+            "outdir",
+            "log_path",
+        ]
+        summary_row = build_summary_csv_row(
+            args.experiment,
+            args.client_count,
+            args.count_per_client,
+            args.outdir,
+            str(log_path),
+            stats,
+        )
+        summary_row.update(extra_fields)
+        summary_fieldnames.extend(extra_fields.keys())
         append_csv_row(
             pathlib.Path(args.csv),
-            [
-                "experiment",
-                "client_count",
-                "count_per_client",
-                "total_requests",
-                "first_start_ns",
-                "last_end_ns",
-                "total_e2e_ns",
-                "avg_latency_ns",
-                "median_latency_ns",
-                "p50_latency_ns",
-                "p99_latency_ns",
-                "aggregate_throughput_mrps",
-                "avg_server_poll_notify_ns",
-                "p50_server_poll_notify_ns",
-                "p99_server_poll_notify_ns",
-                "avg_server_execute_ns",
-                "p50_server_execute_ns",
-                "p99_server_execute_ns",
-                "avg_server_response_ns",
-                "p50_server_response_ns",
-                "p99_server_response_ns",
-                "outdir",
-                "log_path",
-            ],
-            build_summary_csv_row(
-                args.experiment,
-                args.client_count,
-                args.count_per_client,
-                args.outdir,
-                str(log_path),
-                stats,
-            ),
+            summary_fieldnames,
+            summary_row,
         )
 
     if args.steady_csv:
+        steady_fieldnames = [
+            "experiment",
+            "client_count",
+            "count_per_client",
+            "drop_first_requests_per_client",
+            "dropped_requests_total",
+            "steady_requests",
+            "first_kept_start_ns",
+            "first_kept_end_ns",
+            "last_kept_end_ns",
+            "steady_total_e2e_ns",
+            "steady_avg_latency_ns",
+            "steady_avg_reqresp_latency_ns",
+            "steady_median_latency_ns",
+            "steady_p50_latency_ns",
+            "steady_p99_latency_ns",
+            "steady_avg_gap_ns",
+            "steady_median_gap_ns",
+            "steady_p99_gap_ns",
+            "steady_avg_throughput_mrps",
+            "steady_avg_gap_throughput_mrps",
+            "steady_median_throughput_mrps",
+            "steady_avg_server_poll_notify_ns",
+            "steady_p50_server_poll_notify_ns",
+            "steady_p99_server_poll_notify_ns",
+            "steady_avg_server_execute_ns",
+            "steady_p50_server_execute_ns",
+            "steady_p99_server_execute_ns",
+            "steady_avg_server_response_ns",
+            "steady_p50_server_response_ns",
+            "steady_p99_server_response_ns",
+            "outdir",
+            "log_path",
+        ]
+        steady_row = build_steady_csv_row(
+            args.experiment,
+            args.client_count,
+            args.count_per_client,
+            args.outdir,
+            str(log_path),
+            steady_stats,
+        )
+        steady_row.update(extra_fields)
+        steady_fieldnames.extend(extra_fields.keys())
         append_csv_row(
             pathlib.Path(args.steady_csv),
-            [
-                "experiment",
-                "client_count",
-                "count_per_client",
-                "drop_first_requests_per_client",
-                "dropped_requests_total",
-                "steady_requests",
-                "first_kept_start_ns",
-                "first_kept_end_ns",
-                "last_kept_end_ns",
-                "steady_total_e2e_ns",
-                "steady_avg_latency_ns",
-                "steady_avg_reqresp_latency_ns",
-                "steady_median_latency_ns",
-                "steady_p50_latency_ns",
-                "steady_p99_latency_ns",
-                "steady_avg_gap_ns",
-                "steady_median_gap_ns",
-                "steady_p99_gap_ns",
-                "steady_avg_throughput_mrps",
-                "steady_avg_gap_throughput_mrps",
-                "steady_median_throughput_mrps",
-                "steady_avg_server_poll_notify_ns",
-                "steady_p50_server_poll_notify_ns",
-                "steady_p99_server_poll_notify_ns",
-                "steady_avg_server_execute_ns",
-                "steady_p50_server_execute_ns",
-                "steady_p99_server_execute_ns",
-                "steady_avg_server_response_ns",
-                "steady_p50_server_response_ns",
-                "steady_p99_server_response_ns",
-                "outdir",
-                "log_path",
-            ],
-            build_steady_csv_row(
-                args.experiment,
-                args.client_count,
-                args.count_per_client,
-                args.outdir,
-                str(log_path),
-                steady_stats,
-            ),
+            steady_fieldnames,
+            steady_row,
         )
 
     if args.result_json:
@@ -960,6 +1002,7 @@ def main():
             str(log_path),
             benchmark_rc,
             guest_command_rc,
+            extra_fields=extra_fields,
             stats=stats,
             steady_stats=steady_stats,
         )

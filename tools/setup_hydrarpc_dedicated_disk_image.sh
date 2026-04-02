@@ -20,9 +20,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 DISK_IMAGE="${1:-}"
-SOURCE="${REPO_ROOT}/tools/hydrarpc_dedicated.c"
-BUILD_DIR="${REPO_ROOT}/output/hydrarpc_dedicated_guest"
-BINARY_NAME="hydrarpc_dedicated"
+BINARY_NAME="${HYDRARPC_BINARY_NAME:-hydrarpc_dedicated}"
+SOURCE="${HYDRARPC_GUEST_SOURCE:-${REPO_ROOT}/tools/hydrarpc_dedicated.c}"
+BUILD_DIR="${REPO_ROOT}/output/${BINARY_NAME}_guest"
 HOST_BINARY="${BUILD_DIR}/${BINARY_NAME}"
 GEM5_INCLUDE_DIR="${REPO_ROOT}/include"
 M5OPS_SOURCE="${REPO_ROOT}/util/m5/src/abi/x86/m5op.S"
@@ -35,6 +35,7 @@ LEGACY_GUEST_WORKDIR="/root/hydrarpc"
 ROOT_BASHRC="/root/.bashrc"
 CC_BIN="${CC:-gcc}"
 GUEST_CFLAGS="${HYDRARPC_GUEST_CFLAGS:--O2 -Wall -static -g -pthread}"
+GUEST_LDLIBS="${HYDRARPC_GUEST_LDLIBS:-}"
 MOUNT_POINT="/tmp/hydrarpc_dedicated_disk_$$"
 LOOP_DEVICE=""
 
@@ -110,6 +111,7 @@ mkdir -p "${BUILD_DIR}"
   -I "${GEM5_INCLUDE_DIR}" \
   "${M5OPS_SOURCE}" \
   "${SOURCE}" \
+  ${GUEST_LDLIBS} \
   -o "${HOST_BINARY}"
 
 if [[ ! -x "${HOST_BINARY}" ]]; then

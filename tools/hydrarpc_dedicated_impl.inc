@@ -6,6 +6,10 @@
 #error "HYDRARPC_COHERENT must be defined before including hydrarpc_dedicated_impl.inc"
 #endif
 
+#if !defined(HYDRARPC_APP_VARIANT)
+#define HYDRARPC_APP_VARIANT 0
+#endif
+
 #define _GNU_SOURCE
 
 #include <cpuid.h>
@@ -25,6 +29,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <x86intrin.h>
+
+#if HYDRARPC_APP_VARIANT
+#include "hydrarpc_app_runtime.h"
+#endif
 
 #define CACHELINE_SIZE 64u
 #define DEFAULT_REQUEST_PAYLOAD_SIZE 64u
@@ -146,7 +154,7 @@ static uint64_t
 parse_u64(const char *name, const char *value)
 {
     char *end = NULL;
-    unsigned long long parsed = strtoull(value, &end, 10);
+    unsigned long long parsed = strtoull(value, &end, 0);
 
     if (!value[0] || (end && *end != '\0')) {
         fprintf(stderr, "invalid %s: %s\n", name, value);
@@ -155,6 +163,22 @@ parse_u64(const char *name, const char *value)
 
     return (uint64_t)parsed;
 }
+
+#if HYDRARPC_APP_VARIANT
+static double
+parse_double(const char *name, const char *value)
+{
+    char *end = NULL;
+    double parsed = strtod(value, &end);
+
+    if (!value[0] || (end && *end != '\0')) {
+        fprintf(stderr, "invalid %s: %s\n", name, value);
+        exit(2);
+    }
+
+    return parsed;
+}
+#endif
 
 static const char *
 send_mode_string(enum SendMode mode)
@@ -529,6 +553,293 @@ min_u64(uint64_t lhs, uint64_t rhs)
     return lhs < rhs ? lhs : rhs;
 }
 
+struct PayloadLengthPlan {
+    uint64_t min_size;
+    uint64_t max_size;
+};
+
+static uint64_t
+payload_length_plan_len(const struct PayloadLengthPlan *plan,
+                        uint64_t client_id,
+                        uint64_t req_id,
+                        uint64_t client_request_count);
+
+#if HYDRARPC_APP_VARIANT
+struct AppClientWorkload {
+    hydrarpc_app_operation_t *ops;
+    uint64_t request_count;
+};
+
+struct AppRuntime {
+    const char *profile_name;
+    uint64_t record_count;
+    uint64_t dataset_seed;
+    uint64_t workload_seed;
+    size_t key_size;
+    size_t value_size;
+    size_t max_key_size;
+    size_t max_value_size;
+    size_t max_request_size;
+    size_t max_response_size;
+    double read_ratio;
+    double update_ratio;
+    double rmw_ratio;
+    hydrarpc_app_key_dist_t key_dist;
+    double zipf_theta;
+    int variable_layout;
+    struct AppClientWorkload *client_workloads;
+    hydrarpc_app_store_t store;
+};
+
+static const hydrarpc_app_operation_t *
+app_operation_for_seq(const struct AppRuntime *runtime,
+                      uint64_t client_id,
+                      uint64_t req_id)
+{
+    if (!runtime || !runtime->client_workloads ||
+        !runtime->client_workloads[client_id].ops ||
+        req_id >= runtime->client_workloads[client_id].request_count) {
+        return NULL;
+    }
+
+    return &runtime->client_workloads[client_id].ops[req_id];
+}
+
+static void
+free_app_runtime(struct AppRuntime *runtime, uint64_t client_count)
+{
+    if (!runtime)
+        return;
+
+    if (runtime->client_workloads != NULL) {
+        for (uint64_t client_id = 0; client_id < client_count; client_id++)
+            free(runtime->client_workloads[client_id].ops);
+    }
+    free(runtime->client_workloads);
+    hydrarpc_apprt_store_free(&runtime->store);
+    memset(runtime, 0, sizeof(*runtime));
+}
+
+static int
+init_app_runtime(struct AppRuntime *runtime,
+                 uint64_t client_count,
+                 uint64_t request_count,
+                 uint64_t slow_client_count,
+                 uint64_t slow_request_count,
+                 const hydrarpc_app_profile_t *profile,
+                 size_t key_size,
+                 size_t value_size,
+                 int variable_layout,
+                 uint64_t record_count,
+                 double read_ratio,
+                 double update_ratio,
+                 double rmw_ratio,
+                 hydrarpc_app_key_dist_t key_dist,
+                 double zipf_theta,
+                 uint64_t dataset_seed,
+                 uint64_t workload_seed)
+{
+    if (!runtime || !profile || client_count == 0)
+        return -1;
+
+    memset(runtime, 0, sizeof(*runtime));
+    runtime->profile_name = profile->name;
+    runtime->record_count = record_count;
+    runtime->dataset_seed = dataset_seed;
+    runtime->workload_seed = workload_seed;
+    runtime->key_size = key_size;
+    runtime->value_size = value_size;
+    runtime->read_ratio = read_ratio;
+    runtime->update_ratio = update_ratio;
+    runtime->rmw_ratio = rmw_ratio;
+    runtime->key_dist = key_dist;
+    runtime->zipf_theta = zipf_theta;
+    runtime->variable_layout = variable_layout;
+    runtime->max_key_size =
+        variable_layout ?
+            hydrarpc_app_profile_max_key_size(profile->name, key_size) :
+            key_size;
+    runtime->max_value_size =
+        variable_layout ?
+            hydrarpc_app_profile_max_value_size(profile->name, value_size) :
+            value_size;
+    runtime->max_request_size =
+        hydrarpc_app_request_wire_size(HYDRARPC_APP_OP_PUT,
+                                       runtime->max_key_size,
+                                       runtime->max_value_size);
+    runtime->max_response_size =
+        hydrarpc_app_response_wire_size(HYDRARPC_APP_STATUS_OK,
+                                        HYDRARPC_APP_OP_GET,
+                                        runtime->max_value_size);
+
+    runtime->client_workloads =
+        calloc((size_t)client_count, sizeof(*runtime->client_workloads));
+    if (runtime->client_workloads == NULL)
+        goto fail;
+
+    for (uint64_t client_id = 0; client_id < client_count; client_id++) {
+        uint64_t client_request_count = client_request_limit(client_id,
+                                                             request_count,
+                                                             slow_client_count,
+                                                             slow_request_count);
+
+        runtime->client_workloads[client_id].request_count = client_request_count;
+        if (client_request_count == 0)
+            continue;
+
+        runtime->client_workloads[client_id].ops =
+            calloc((size_t)client_request_count,
+                   sizeof(*runtime->client_workloads[client_id].ops));
+        if (runtime->client_workloads[client_id].ops == NULL)
+            goto fail;
+
+        if (hydrarpc_apprt_build_operations(
+                runtime->client_workloads[client_id].ops,
+                client_request_count,
+                profile->name,
+                record_count,
+                key_size,
+                value_size,
+                runtime->max_key_size,
+                read_ratio,
+                update_ratio,
+                rmw_ratio,
+                key_dist,
+                zipf_theta,
+                dataset_seed,
+                workload_seed ^ (client_id + 1u)) != 0) {
+            goto fail;
+        }
+    }
+
+    if (hydrarpc_apprt_store_init(&runtime->store,
+                                  profile->name,
+                                  (size_t)record_count,
+                                  key_size,
+                                  value_size,
+                                  runtime->max_key_size,
+                                  runtime->max_value_size,
+                                  dataset_seed) != 0 ||
+        hydrarpc_apprt_store_preload(&runtime->store) != 0) {
+        goto fail;
+    }
+
+    return 0;
+
+fail:
+    free_app_runtime(runtime, client_count);
+    return -1;
+}
+
+static inline uint64_t
+request_len_for_seq(const struct PayloadLengthPlan *plan,
+                    const struct AppRuntime *app_runtime,
+                    uint64_t client_id,
+                    uint64_t req_id,
+                    uint64_t client_request_count)
+{
+    const hydrarpc_app_operation_t *op =
+        app_operation_for_seq(app_runtime, client_id, req_id);
+
+    if (op == NULL)
+        return 0;
+
+    (void)plan;
+    (void)client_request_count;
+    return op->request_len;
+}
+
+static inline uint64_t
+response_len_for_seq(const struct PayloadLengthPlan *plan,
+                     const struct AppRuntime *app_runtime,
+                     uint64_t client_id,
+                     uint64_t req_id,
+                     uint64_t client_request_count)
+{
+    const hydrarpc_app_operation_t *op =
+        app_operation_for_seq(app_runtime, client_id, req_id);
+
+    if (op == NULL)
+        return 0;
+
+    (void)plan;
+    (void)client_request_count;
+    return op->response_len;
+}
+#else
+static inline uint64_t
+request_len_for_seq(const struct PayloadLengthPlan *plan,
+                    uint64_t client_id,
+                    uint64_t req_id,
+                    uint64_t client_request_count)
+{
+    return payload_length_plan_len(plan, client_id, req_id, client_request_count);
+}
+
+static inline uint64_t
+response_len_for_seq(const struct PayloadLengthPlan *plan,
+                     uint64_t client_id,
+                     uint64_t req_id,
+                     uint64_t client_request_count)
+{
+    return payload_length_plan_len(plan, client_id, req_id, client_request_count);
+}
+#endif
+
+static inline uint64_t
+payload_length_plan_stride(const struct PayloadLengthPlan *plan)
+{
+    return plan->max_size;
+}
+
+static inline int
+payload_length_plan_is_uniform(const struct PayloadLengthPlan *plan)
+{
+    return plan->min_size != plan->max_size;
+}
+
+static inline uint64_t
+payload_length_plan_midpoint(const struct PayloadLengthPlan *plan)
+{
+    return plan->min_size + ((plan->max_size - plan->min_size) / 2u);
+}
+
+static inline uint64_t
+payload_length_plan_slot_index(uint64_t client_id,
+                               uint64_t req_id,
+                               uint64_t client_request_count)
+{
+    if (client_request_count <= 1)
+        return 0;
+
+    return (req_id + (client_id % client_request_count)) % client_request_count;
+}
+
+static uint64_t
+payload_length_plan_len(const struct PayloadLengthPlan *plan,
+                        uint64_t client_id,
+                        uint64_t req_id,
+                        uint64_t client_request_count)
+{
+    uint64_t span = 0;
+    uint64_t denom = 0;
+    uint64_t slot_index = 0;
+
+    if (!payload_length_plan_is_uniform(plan))
+        return plan->min_size;
+
+    if (client_request_count <= 1)
+        return payload_length_plan_midpoint(plan);
+
+    span = plan->max_size - plan->min_size;
+    denom = client_request_count - 1;
+    slot_index = payload_length_plan_slot_index(client_id,
+                                                req_id,
+                                                client_request_count);
+    return plan->min_size +
+           (uint64_t)((((__uint128_t)span * slot_index) + (denom / 2u)) / denom);
+}
+
 static void
 signal_ready_and_wait(struct SharedControl *control)
 {
@@ -675,6 +986,140 @@ store_response_payload(uint8_t *remote_dst,
                                   request_payload_size);
 }
 
+#if HYDRARPC_APP_VARIANT
+static int
+build_client_request_payload(const struct AppRuntime *app_runtime,
+                             uint64_t client_id,
+                             uint64_t req_id,
+                             uint8_t *remote_dst,
+                             uint8_t *request_shadow,
+                             uint64_t request_payload_size,
+                             uint64_t *rng_state,
+                             enum TransferMode transfer_mode)
+{
+    const hydrarpc_app_operation_t *op =
+        app_operation_for_seq(app_runtime, client_id, req_id);
+    size_t built_len = 0;
+
+    (void)rng_state;
+    if (transfer_mode != TRANSFER_STAGING || op == NULL)
+        return -1;
+
+    built_len = hydrarpc_apprt_encode_request(request_shadow,
+                                              (size_t)request_payload_size,
+                                              op,
+                                              app_runtime->dataset_seed);
+    if (built_len != request_payload_size)
+        return -1;
+
+    store_payload_remote(remote_dst, request_shadow, request_payload_size);
+    return 0;
+}
+
+static int
+build_server_response_payload(struct AppRuntime *app_runtime,
+                              uint8_t *remote_dst,
+                              uint64_t response_payload_stride,
+                              const uint8_t *request_bytes,
+                              uint64_t request_payload_size,
+                              enum TransferMode transfer_mode,
+                              uint8_t *response_staging,
+                              uint64_t *response_payload_size_out)
+{
+    size_t response_len = 0;
+
+    (void)remote_dst;
+    if (transfer_mode != TRANSFER_STAGING || response_staging == NULL ||
+        response_payload_size_out == NULL) {
+        return -1;
+    }
+
+    if (hydrarpc_apprt_store_process_request(&app_runtime->store,
+                                             request_bytes,
+                                             (size_t)request_payload_size,
+                                             response_staging,
+                                             (size_t)response_payload_stride,
+                                             &response_len) != 0) {
+        return -1;
+    }
+
+    *response_payload_size_out = response_len;
+    store_payload_remote(remote_dst, response_staging, response_len);
+    return 0;
+}
+
+static int
+client_response_matches(const struct AppRuntime *app_runtime,
+                        uint64_t client_id,
+                        uint64_t req_id,
+                        const uint8_t *response_bytes,
+                        uint64_t response_payload_size,
+                        const uint8_t *request_bytes,
+                        uint64_t request_payload_size)
+{
+    const hydrarpc_app_operation_t *op =
+        app_operation_for_seq(app_runtime, client_id, req_id);
+
+    (void)request_bytes;
+    (void)request_payload_size;
+    return (op != NULL &&
+            hydrarpc_apprt_validate_response(response_bytes,
+                                             (size_t)response_payload_size,
+                                             op) == 0);
+}
+#else
+static int
+build_client_request_payload(uint8_t *remote_dst,
+                             uint8_t *request_shadow,
+                             uint64_t request_payload_size,
+                             uint64_t *rng_state,
+                             enum TransferMode transfer_mode)
+{
+    store_request_payload(remote_dst,
+                          request_shadow,
+                          request_payload_size,
+                          rng_state,
+                          transfer_mode);
+    return 0;
+}
+
+static int
+build_server_response_payload(uint8_t *remote_dst,
+                              uint64_t response_payload_size,
+                              const uint8_t *request_bytes,
+                              uint64_t request_payload_size,
+                              enum TransferMode transfer_mode,
+                              uint8_t *response_staging,
+                              uint64_t *response_payload_size_out)
+{
+    store_response_payload(remote_dst,
+                           response_payload_size,
+                           request_bytes,
+                           request_payload_size,
+                           transfer_mode,
+                           response_staging);
+    if (response_payload_size_out != NULL)
+        *response_payload_size_out = response_payload_size;
+    return 0;
+}
+
+static int
+client_response_matches(uint64_t client_id,
+                        uint64_t req_id,
+                        const uint8_t *response_bytes,
+                        uint64_t response_payload_size,
+                        const uint8_t *request_bytes,
+                        uint64_t request_payload_size)
+{
+    (void)client_id;
+    (void)req_id;
+    return response_matches_request(response_bytes,
+                                    response_payload_size,
+                                    request_bytes,
+                                    request_payload_size);
+}
+#endif
+
 static int
 run_server_dedicated(struct Connection *connections,
                      uint64_t client_count,
@@ -683,23 +1128,30 @@ run_server_dedicated(struct Connection *connections,
                      uint64_t slow_client_count,
                      uint64_t slow_request_count,
                      uint64_t total_request_target,
-                     uint64_t request_payload_size,
-                     uint64_t response_payload_size,
+                     const struct PayloadLengthPlan *request_length_plan,
+                     const struct PayloadLengthPlan *response_length_plan,
                      enum TransferMode response_transfer_mode,
+#if HYDRARPC_APP_VARIANT
+                     struct AppRuntime *app_runtime,
+#endif
                      struct RequestTimingData *timing,
                      int server_cpu,
                      struct SharedControl *control)
 {
+    uint64_t request_payload_stride =
+        payload_length_plan_stride(request_length_plan);
+    uint64_t response_payload_stride =
+        payload_length_plan_stride(response_length_plan);
     uint64_t *next_seq = calloc((size_t)client_count, sizeof(*next_seq));
     uint64_t *response_data_tail =
         calloc((size_t)client_count, sizeof(*response_data_tail));
     uint64_t completed_total = 0;
     uint64_t next_client_hint = 0;
-    uint8_t *request_payload_local = malloc((size_t)request_payload_size);
+    uint8_t *request_payload_local = malloc((size_t)request_payload_stride);
     uint8_t *response_staging = NULL;
 
     if (response_transfer_mode == TRANSFER_STAGING)
-        response_staging = malloc((size_t)response_payload_size);
+        response_staging = malloc((size_t)response_payload_stride);
 
     if (next_seq == NULL || response_data_tail == NULL ||
         request_payload_local == NULL ||
@@ -747,6 +1199,8 @@ run_server_dedicated(struct Connection *connections,
             uint64_t request_len = 0;
             uint64_t request_offset = 0;
             uint64_t response_offset = 0;
+            uint64_t expected_request_len = 0;
+            uint64_t expected_response_len = 0;
             uint64_t server_req_observe_ts = 0;
             uint64_t server_exec_done_ts = 0;
             uint64_t server_resp_done_ts = 0;
@@ -756,6 +1210,31 @@ run_server_dedicated(struct Connection *connections,
 
             if (seq >= client_request_count)
                 continue;
+
+            expected_request_len =
+#if HYDRARPC_APP_VARIANT
+                request_len_for_seq(request_length_plan,
+                                    app_runtime,
+                                    client_id,
+                                    seq,
+                                    client_request_count);
+            expected_response_len =
+                response_len_for_seq(response_length_plan,
+                                     app_runtime,
+                                     client_id,
+                                     seq,
+                                     client_request_count);
+#else
+                request_len_for_seq(request_length_plan,
+                                    client_id,
+                                    seq,
+                                    client_request_count);
+            expected_response_len =
+                response_len_for_seq(response_length_plan,
+                                     client_id,
+                                     seq,
+                                     client_request_count);
+#endif
 
             slot = seq % slot_count;
             index = request_result_index(client_id, seq, request_count);
@@ -772,7 +1251,7 @@ run_server_dedicated(struct Connection *connections,
                 continue;
 
             request_len = notify_len(request_notify);
-            if (request_len != request_payload_size) {
+            if (request_len != expected_request_len) {
                 fprintf(stderr, "server observed unexpected request length\n");
                 set_control_error(control);
                 break;
@@ -789,17 +1268,39 @@ run_server_dedicated(struct Connection *connections,
             clear_notify_word_remote(request_queue_line);
 
             response_offset = response_data_tail[client_id];
-            store_response_payload(
-                payload_at_offset(connection->response_data_area, response_offset),
-                response_payload_size,
-                request_payload_local,
-                request_payload_size,
-                response_transfer_mode,
-                response_staging
-            );
+            if (
+#if HYDRARPC_APP_VARIANT
+                build_server_response_payload(
+                    app_runtime,
+                    payload_at_offset(connection->response_data_area,
+                                      response_offset),
+                    response_payload_stride,
+                    request_payload_local,
+                    request_len,
+                    response_transfer_mode,
+                    response_staging,
+                    &expected_response_len
+                ) != 0
+#else
+                build_server_response_payload(
+                    payload_at_offset(connection->response_data_area,
+                                      response_offset),
+                    expected_response_len,
+                    request_payload_local,
+                    request_len,
+                    response_transfer_mode,
+                    response_staging,
+                    &expected_response_len
+                ) != 0
+#endif
+            ) {
+                fprintf(stderr, "server failed to build response payload\n");
+                set_control_error(control);
+                break;
+            }
             write_notify_word_remote(response_queue_line,
                                      notify_make(response_offset,
-                                                 response_payload_size));
+                                                 expected_response_len));
             server_resp_done_ts = m5_rpns_ns();
             store_shared_u64(&timing->server_req_observe_ts_ns[index],
                              server_req_observe_ts);
@@ -808,7 +1309,8 @@ run_server_dedicated(struct Connection *connections,
             store_shared_u64(&timing->server_resp_done_ts_ns[index],
                              server_resp_done_ts);
 
-            response_data_tail[client_id] += payload_span_u64(response_payload_size);
+            response_data_tail[client_id] +=
+                payload_span_u64(expected_response_len);
             next_seq[client_id]++;
             completed_total++;
             next_client_hint = (client_id + 1) % client_count;
@@ -836,12 +1338,15 @@ run_client_dedicated(struct Connection *connection,
                      uint64_t request_count,
                      uint64_t slow_client_count,
                      uint64_t slow_request_count,
-                     uint64_t request_payload_size,
-                     uint64_t response_payload_size,
+                     const struct PayloadLengthPlan *request_length_plan,
+                     const struct PayloadLengthPlan *response_length_plan,
                      enum SendMode send_mode,
                      uint64_t send_gap_ns,
                      uint64_t slow_send_gap_ns,
                      enum TransferMode request_transfer_mode,
+#if HYDRARPC_APP_VARIANT
+                     const struct AppRuntime *app_runtime,
+#endif
                      struct RequestTimingData *timing,
                      struct SharedControl *control)
 {
@@ -859,9 +1364,13 @@ run_client_dedicated(struct Connection *connection,
     uint64_t steady_schedule_started = 0;
     enum SendMode effective_send_mode = send_mode;
     uint64_t effective_send_gap_ns = send_gap_ns;
+    uint64_t request_payload_stride =
+        payload_length_plan_stride(request_length_plan);
+    uint64_t response_payload_stride =
+        payload_length_plan_stride(response_length_plan);
     uint8_t *request_shadow_local = calloc((size_t)client_request_count,
-                                           (size_t)request_payload_size);
-    uint8_t *response_local = malloc((size_t)response_payload_size);
+                                           (size_t)request_payload_stride);
+    uint8_t *response_local = malloc((size_t)response_payload_stride);
 
     if (request_shadow_local == NULL || response_local == NULL) {
         fprintf(stderr, "client %" PRIu64 " local tracking allocation failed\n",
@@ -915,28 +1424,63 @@ run_client_dedicated(struct Connection *connection,
                 if (!notify_valid(load_notify_word_remote(request_queue_line))) {
                     uint64_t start = 0;
                     uint64_t request_offset = request_data_tail;
+                    uint64_t request_payload_len =
+#if HYDRARPC_APP_VARIANT
+                        request_len_for_seq(request_length_plan,
+                                            app_runtime,
+                                            client_id,
+                                            sent,
+                                            client_request_count);
+#else
+                        request_len_for_seq(request_length_plan,
+                                            client_id,
+                                            sent,
+                                            client_request_count);
+#endif
                     size_t index = base + sent;
                     uint8_t *request_shadow =
                         request_shadow_at(request_shadow_local,
                                           sent,
-                                          request_payload_size);
+                                          request_payload_stride);
 
                     start = m5_rpns_ns();
 
                     store_shared_u64(&timing->client_req_start_ts_ns[index], start);
-                    store_request_payload(
-                        payload_at_offset(connection->request_data_area,
-                                          request_offset),
-                        request_shadow,
-                        request_payload_size,
-                        &rng_state,
-                        request_transfer_mode
-                    );
+                    if (
+#if HYDRARPC_APP_VARIANT
+                        build_client_request_payload(
+                            app_runtime,
+                            client_id,
+                            sent,
+                            payload_at_offset(connection->request_data_area,
+                                              request_offset),
+                            request_shadow,
+                            request_payload_len,
+                            &rng_state,
+                            request_transfer_mode
+                        ) != 0
+#else
+                        build_client_request_payload(
+                            payload_at_offset(connection->request_data_area,
+                                              request_offset),
+                            request_shadow,
+                            request_payload_len,
+                            &rng_state,
+                            request_transfer_mode
+                        ) != 0
+#endif
+                    ) {
+                        fprintf(stderr,
+                                "client %" PRIu64 " failed to build request payload\n",
+                                client_id);
+                        set_control_error(control);
+                        break;
+                    }
                     write_notify_word_remote(request_queue_line,
                                              notify_make(request_offset,
-                                                         request_payload_size));
+                                                         request_payload_len));
 
-                    request_data_tail += payload_span_u64(request_payload_size);
+                    request_data_tail += payload_span_u64(request_payload_len);
                     sent++;
                     made_progress = 1;
                 }
@@ -947,21 +1491,45 @@ run_client_dedicated(struct Connection *connection,
             uint64_t slot = completed % slot_count;
             volatile struct NotifyQueueLine *response_queue_line =
                 notify_queue_line_at(connection->response_queue, slot);
-            uint64_t response_notify = load_notify_word_remote(response_queue_line);
+                uint64_t response_notify = load_notify_word_remote(response_queue_line);
 
-            if (notify_valid(response_notify)) {
-                uint64_t response_len = notify_len(response_notify);
-                uint64_t response_offset = notify_offset(response_notify);
-                uint8_t *request_shadow =
-                    request_shadow_at(request_shadow_local,
-                                      completed,
-                                      request_payload_size);
-                uint64_t end = 0;
+                if (notify_valid(response_notify)) {
+                    uint64_t response_len = notify_len(response_notify);
+                    uint64_t response_offset = notify_offset(response_notify);
+                    uint64_t expected_request_len =
+#if HYDRARPC_APP_VARIANT
+                        request_len_for_seq(request_length_plan,
+                                            app_runtime,
+                                            client_id,
+                                            completed,
+                                            client_request_count);
+                    uint64_t expected_response_len =
+                        response_len_for_seq(response_length_plan,
+                                             app_runtime,
+                                             client_id,
+                                             completed,
+                                             client_request_count);
+#else
+                        request_len_for_seq(request_length_plan,
+                                            client_id,
+                                            completed,
+                                            client_request_count);
+                    uint64_t expected_response_len =
+                        response_len_for_seq(response_length_plan,
+                                             client_id,
+                                             completed,
+                                             client_request_count);
+#endif
+                    uint8_t *request_shadow =
+                        request_shadow_at(request_shadow_local,
+                                          completed,
+                                          request_payload_stride);
+                    uint64_t end = 0;
 
-                if (response_len != response_payload_size) {
-                    fprintf(stderr,
-                            "client %" PRIu64 " observed unexpected response length\n",
-                            client_id);
+                    if (response_len != expected_response_len) {
+                        fprintf(stderr,
+                                "client %" PRIu64 " observed unexpected response length\n",
+                                client_id);
                     set_control_error(control);
                     break;
                 }
@@ -971,14 +1539,28 @@ run_client_dedicated(struct Connection *connection,
                     payload_at_offset(connection->response_data_area,
                                       response_offset),
                     response_len
-                );
-                if (!response_matches_request(response_local,
-                                             response_payload_size,
-                                             request_shadow,
-                                             request_payload_size)) {
-                    fprintf(stderr,
-                            "client response payload mismatch client=%" PRIu64
-                            " req=%" PRIu64 "\n",
+                    );
+                    if (
+#if HYDRARPC_APP_VARIANT
+                        !client_response_matches(app_runtime,
+                                                 client_id,
+                                                 completed,
+                                                 response_local,
+                                                 response_len,
+                                                 request_shadow,
+                                                 expected_request_len)
+#else
+                        !client_response_matches(client_id,
+                                                 completed,
+                                                 response_local,
+                                                 response_len,
+                                                 request_shadow,
+                                                 expected_request_len)
+#endif
+                    ) {
+                        fprintf(stderr,
+                                "client response payload mismatch client=%" PRIu64
+                                " req=%" PRIu64 "\n",
                             client_id,
                             completed);
                     set_control_error(control);
@@ -1169,6 +1751,14 @@ main(int argc, char **argv)
     uint64_t slow_request_count = 0;
     uint64_t request_payload_size = DEFAULT_REQUEST_PAYLOAD_SIZE;
     uint64_t response_payload_size = DEFAULT_RESPONSE_PAYLOAD_SIZE;
+    uint64_t request_payload_min_size = 0;
+    uint64_t request_payload_max_size = 0;
+    uint64_t response_payload_min_size = 0;
+    uint64_t response_payload_max_size = 0;
+    int request_payload_min_set = 0;
+    int request_payload_max_set = 0;
+    int response_payload_min_set = 0;
+    int response_payload_max_set = 0;
     int cxl_node = 1;
     int server_cpu = -1;
     uint64_t send_gap_ns = 0;
@@ -1185,12 +1775,46 @@ main(int argc, char **argv)
     size_t response_queue_size = 0;
     size_t request_data_size = 0;
     size_t response_data_size = 0;
+    struct PayloadLengthPlan request_length_plan = {0};
+    struct PayloadLengthPlan response_length_plan = {0};
+#if HYDRARPC_APP_VARIANT
+    hydrarpc_app_profile_t app_profile;
+    struct AppRuntime app_runtime = {0};
+    uint64_t app_record_count = HYDRARPC_APP_DEFAULT_RECORD_COUNT;
+    uint64_t app_dataset_seed = HYDRARPC_APP_DEFAULT_DATASET_SEED;
+    uint64_t app_workload_seed = HYDRARPC_APP_DEFAULT_WORKLOAD_SEED;
+    size_t app_key_size = 0;
+    size_t app_value_size = 0;
+    double app_read_ratio = 0.0;
+    double app_update_ratio = 0.0;
+    double app_rmw_ratio = 0.0;
+    hydrarpc_app_key_dist_t app_key_dist = HYDRARPC_APP_KEY_DIST_ZIPF;
+    double app_zipf_theta = 0.0;
+    int app_key_size_overridden = 0;
+    int app_value_size_overridden = 0;
+    int app_variable_layout = 0;
+#endif
     struct Connection *connections = NULL;
     struct SharedControl *control = NULL;
     struct RequestTimingData timing = {0};
     pid_t *child_pids = NULL;
     uint64_t created_children = 0;
     int rc = 0;
+
+#if HYDRARPC_APP_VARIANT
+    if (hydrarpc_app_lookup_profile(HYDRARPC_APP_PROFILE_YCSB_C_1K,
+                                    &app_profile) != 0) {
+        fprintf(stderr, "failed to load default application profile\n");
+        return 1;
+    }
+    app_key_size = app_profile.key_size;
+    app_value_size = app_profile.value_size;
+    app_read_ratio = app_profile.read_ratio;
+    app_update_ratio = app_profile.update_ratio;
+    app_rmw_ratio = app_profile.rmw_ratio;
+    app_key_dist = app_profile.key_dist;
+    app_zipf_theta = app_profile.zipf_theta;
+#endif
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--client-count") == 0 && i + 1 < argc) {
@@ -1206,6 +1830,18 @@ main(int argc, char **argv)
             request_payload_size = parse_u64("req-bytes", argv[++i]);
         } else if (strcmp(argv[i], "--resp-bytes") == 0 && i + 1 < argc) {
             response_payload_size = parse_u64("resp-bytes", argv[++i]);
+        } else if (strcmp(argv[i], "--req-min-bytes") == 0 && i + 1 < argc) {
+            request_payload_min_size = parse_u64("req-min-bytes", argv[++i]);
+            request_payload_min_set = 1;
+        } else if (strcmp(argv[i], "--req-max-bytes") == 0 && i + 1 < argc) {
+            request_payload_max_size = parse_u64("req-max-bytes", argv[++i]);
+            request_payload_max_set = 1;
+        } else if (strcmp(argv[i], "--resp-min-bytes") == 0 && i + 1 < argc) {
+            response_payload_min_size = parse_u64("resp-min-bytes", argv[++i]);
+            response_payload_min_set = 1;
+        } else if (strcmp(argv[i], "--resp-max-bytes") == 0 && i + 1 < argc) {
+            response_payload_max_size = parse_u64("resp-max-bytes", argv[++i]);
+            response_payload_max_set = 1;
         } else if (strcmp(argv[i], "--slow-client-count") == 0 &&
                    i + 1 < argc) {
             slow_client_count = parse_u64("slow-client-count", argv[++i]);
@@ -1229,11 +1865,47 @@ main(int argc, char **argv)
         } else if (strcmp(argv[i], "--response-transfer-mode") == 0 &&
                    i + 1 < argc) {
             response_transfer_mode = parse_transfer_mode(argv[++i]);
+#if HYDRARPC_APP_VARIANT
+        } else if (strcmp(argv[i], "--profile") == 0 && i + 1 < argc) {
+            if (hydrarpc_app_lookup_profile(argv[++i], &app_profile) != 0) {
+                fprintf(stderr, "invalid profile: %s\n", argv[i]);
+                return 2;
+            }
+            app_key_size = app_profile.key_size;
+            app_value_size = app_profile.value_size;
+            app_read_ratio = app_profile.read_ratio;
+            app_update_ratio = app_profile.update_ratio;
+            app_rmw_ratio = app_profile.rmw_ratio;
+            app_key_dist = app_profile.key_dist;
+            app_zipf_theta = app_profile.zipf_theta;
+        } else if (strcmp(argv[i], "--record-count") == 0 && i + 1 < argc) {
+            app_record_count = parse_u64("record-count", argv[++i]);
+        } else if (strcmp(argv[i], "--dataset-seed") == 0 && i + 1 < argc) {
+            app_dataset_seed = parse_u64("dataset-seed", argv[++i]);
+        } else if (strcmp(argv[i], "--workload-seed") == 0 && i + 1 < argc) {
+            app_workload_seed = parse_u64("workload-seed", argv[++i]);
+        } else if (strcmp(argv[i], "--key-size") == 0 && i + 1 < argc) {
+            app_key_size = (size_t)parse_u64("key-size", argv[++i]);
+            app_key_size_overridden = 1;
+        } else if (strcmp(argv[i], "--value-size") == 0 && i + 1 < argc) {
+            app_value_size = (size_t)parse_u64("value-size", argv[++i]);
+            app_value_size_overridden = 1;
+        } else if (strcmp(argv[i], "--read-ratio") == 0 && i + 1 < argc) {
+            app_read_ratio = parse_double("read-ratio", argv[++i]);
+        } else if (strcmp(argv[i], "--update-ratio") == 0 && i + 1 < argc) {
+            app_update_ratio = parse_double("update-ratio", argv[++i]);
+        } else if (strcmp(argv[i], "--rmw-ratio") == 0 && i + 1 < argc) {
+            app_rmw_ratio = parse_double("rmw-ratio", argv[++i]);
+        } else if (strcmp(argv[i], "--zipf-theta") == 0 && i + 1 < argc) {
+            app_zipf_theta = parse_double("zipf-theta", argv[++i]);
+#endif
         } else if (strcmp(argv[i], "--help") == 0 ||
                    strcmp(argv[i], "-h") == 0) {
             printf("Usage: %s [--client-count N] [--count-per-client N] "
                    "[--window-size N] [--slot-count N] "
                    "[--req-bytes N] [--resp-bytes N] "
+                   "[--req-min-bytes N] [--req-max-bytes N] "
+                   "[--resp-min-bytes N] [--resp-max-bytes N] "
                    "[--slow-client-count N] [--slow-count-per-client N] "
                    "[--slow-send-gap-ns N] [--cxl-node N] "
                    "[--send-mode greedy|uniform|staggered|uneven] "
@@ -1247,6 +1919,9 @@ main(int argc, char **argv)
                    "default is min(window-size, count-per-client)\n"
                    "  req-bytes/resp-bytes set the request/response payload sizes; "
                    "defaults are %" PRIu64 "/%" PRIu64 " bytes\n"
+                   "  req/resp-min-bytes and req/resp-max-bytes optionally enable "
+                   "deterministic per-request uniform bins across each client's "
+                   "request sequence\n"
                    "  each client owns independent request/response data areas; "
                    "payload areas are append-only and payloads carry no header\n"
                    "  request-transfer-mode controls how clients publish request "
@@ -1293,21 +1968,131 @@ main(int argc, char **argv)
         goto cleanup;
     }
 
-    if (request_payload_size == 0 || request_payload_size > NOTIFY_LEN_MAX) {
+#if HYDRARPC_APP_VARIANT
+    if (app_key_size == 0 || app_key_size > HYDRARPC_APP_MAX_KEY_SIZE) {
+        fprintf(stderr, "key-size must be in [1, %u]\n",
+                (unsigned)HYDRARPC_APP_MAX_KEY_SIZE);
+        rc = 2;
+        goto cleanup;
+    }
+    if (app_value_size == 0 || app_value_size > NOTIFY_LEN_MAX) {
+        fprintf(stderr, "value-size must be in [1, %u]\n",
+                (unsigned)NOTIFY_LEN_MAX);
+        rc = 2;
+        goto cleanup;
+    }
+    if (app_record_count == 0 || app_dataset_seed == 0 || app_workload_seed == 0) {
+        fprintf(stderr, "record-count/dataset-seed/workload-seed must be positive\n");
+        rc = 2;
+        goto cleanup;
+    }
+    if (app_read_ratio < 0.0 || app_update_ratio < 0.0 ||
+        app_rmw_ratio < 0.0 ||
+        (app_key_dist == HYDRARPC_APP_KEY_DIST_ZIPF &&
+         app_zipf_theta < 0.01) ||
+        fabs((app_read_ratio + app_update_ratio + app_rmw_ratio) - 1.0) > 1e-6) {
         fprintf(stderr,
-                "req-bytes must be in [1, %u]\n",
+                "read-ratio + update-ratio + rmw-ratio must equal 1.0 and zipf-theta must be >= 0.01 for zipf workloads\n");
+        rc = 2;
+        goto cleanup;
+    }
+    if (request_transfer_mode != TRANSFER_STAGING ||
+        response_transfer_mode != TRANSFER_STAGING) {
+        fprintf(stderr,
+                "application dedicated mode currently requires staging request/response transfers\n");
+        rc = 2;
+        goto cleanup;
+    }
+
+    app_variable_layout =
+        hydrarpc_app_profile_has_variable_layout(app_profile.name) &&
+        !app_key_size_overridden &&
+        !app_value_size_overridden;
+    if (init_app_runtime(&app_runtime,
+                         client_count,
+                         request_count,
+                         slow_client_count,
+                         slow_request_count,
+                         &app_profile,
+                         app_key_size,
+                         app_value_size,
+                         app_variable_layout,
+                         app_record_count,
+                         app_read_ratio,
+                         app_update_ratio,
+                         app_rmw_ratio,
+                         app_key_dist,
+                         app_zipf_theta,
+                         app_dataset_seed,
+                         app_workload_seed) != 0) {
+        fprintf(stderr, "failed to initialize application runtime\n");
+        rc = 1;
+        goto cleanup;
+    }
+
+    request_length_plan.min_size = app_runtime.max_request_size;
+    request_length_plan.max_size = app_runtime.max_request_size;
+    response_length_plan.min_size = app_runtime.max_response_size;
+    response_length_plan.max_size = app_runtime.max_response_size;
+    if (request_length_plan.max_size > NOTIFY_LEN_MAX ||
+        response_length_plan.max_size > NOTIFY_LEN_MAX) {
+        fprintf(stderr,
+                "application request/response payload exceeds notify length limit (%u)\n",
+                (unsigned)NOTIFY_LEN_MAX);
+        rc = 2;
+        goto cleanup;
+    }
+#else
+    if (!request_payload_min_set)
+        request_payload_min_size = request_payload_size;
+    if (!request_payload_max_set)
+        request_payload_max_size = request_payload_size;
+    if (!response_payload_min_set)
+        response_payload_min_size = response_payload_size;
+    if (!response_payload_max_set)
+        response_payload_max_size = response_payload_size;
+
+    request_length_plan.min_size = request_payload_min_size;
+    request_length_plan.max_size = request_payload_max_size;
+    response_length_plan.min_size = response_payload_min_size;
+    response_length_plan.max_size = response_payload_max_size;
+
+    if (request_length_plan.min_size == 0 ||
+        request_length_plan.min_size > NOTIFY_LEN_MAX ||
+        request_length_plan.max_size == 0 ||
+        request_length_plan.max_size > NOTIFY_LEN_MAX) {
+        fprintf(stderr,
+                "request payload sizes must be in [1, %u]\n",
                 (unsigned)NOTIFY_LEN_MAX);
         rc = 2;
         goto cleanup;
     }
 
-    if (response_payload_size == 0 || response_payload_size > NOTIFY_LEN_MAX) {
+    if (request_length_plan.min_size > request_length_plan.max_size) {
         fprintf(stderr,
-                "resp-bytes must be in [1, %u]\n",
+                "req-min-bytes must be <= req-max-bytes\n");
+        rc = 2;
+        goto cleanup;
+    }
+
+    if (response_length_plan.min_size == 0 ||
+        response_length_plan.min_size > NOTIFY_LEN_MAX ||
+        response_length_plan.max_size == 0 ||
+        response_length_plan.max_size > NOTIFY_LEN_MAX) {
+        fprintf(stderr,
+                "response payload sizes must be in [1, %u]\n",
                 (unsigned)NOTIFY_LEN_MAX);
         rc = 2;
         goto cleanup;
     }
+
+    if (response_length_plan.min_size > response_length_plan.max_size) {
+        fprintf(stderr,
+                "resp-min-bytes must be <= resp-max-bytes\n");
+        rc = 2;
+        goto cleanup;
+    }
+#endif
 
     if (window_size == 0) {
         fprintf(stderr, "window-size must be positive\n");
@@ -1392,8 +2177,8 @@ main(int argc, char **argv)
                                                request_count,
                                                slow_client_count,
                                                slow_request_count);
-    request_span = payload_span_u64(request_payload_size);
-    response_span = payload_span_u64(response_payload_size);
+    request_span = payload_span_u64(payload_length_plan_stride(&request_length_plan));
+    response_span = payload_span_u64(payload_length_plan_stride(&response_length_plan));
     request_queue_size = sizeof(struct NotifyQueueLine) * slot_count;
     response_queue_size = sizeof(struct NotifyQueueLine) * slot_count;
     request_data_size = (size_t)(request_count * request_span);
@@ -1465,9 +2250,12 @@ main(int argc, char **argv)
                                                 slow_client_count,
                                                 slow_request_count,
                                                 total_request_target,
-                                                request_payload_size,
-                                                response_payload_size,
+                                                &request_length_plan,
+                                                &response_length_plan,
                                                 response_transfer_mode,
+#if HYDRARPC_APP_VARIANT
+                                                &app_runtime,
+#endif
                                                 &timing,
                                                 server_cpu,
                                                 control);
@@ -1496,12 +2284,15 @@ main(int argc, char **argv)
                                                 request_count,
                                                 slow_client_count,
                                                 slow_request_count,
-                                                request_payload_size,
-                                                response_payload_size,
+                                                &request_length_plan,
+                                                &response_length_plan,
                                                 send_mode,
                                                 send_gap_ns,
                                                 slow_send_gap_ns,
                                                 request_transfer_mode,
+#if HYDRARPC_APP_VARIANT
+                                                &app_runtime,
+#endif
                                                 &timing,
                                                 control);
             _exit(child_rc == 0 ? 0 : 1);
@@ -1564,6 +2355,9 @@ wait_children:
     }
 
 cleanup:
+#if HYDRARPC_APP_VARIANT
+    free_app_runtime(&app_runtime, client_count);
+#endif
     if (connections != NULL) {
         for (uint64_t client_id = 0; client_id < client_count; client_id++) {
             if (connections[client_id].request_queue != NULL) {
