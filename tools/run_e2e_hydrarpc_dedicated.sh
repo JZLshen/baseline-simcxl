@@ -37,6 +37,9 @@ Options:
   --cxl-node <N>           NUMA node used for CXL mappings inside guest. Default: 1
   --num-cpus <N>           Guest CPU count. Default: client-count + 2
   --server-cpu <N>         Server CPU id. Default: client-count
+  --restore-checkpoint <dir>
+                           Restore from an existing boot checkpoint and start
+                           directly with CPU_TYPE cores.
   --terminal-port <N>      Host TCP port reserved for the guest COM1 listener. Default: auto-pick
   --guest-cflags <flags>   Host gcc flags used to build the injected guest binary.
                            Default: -O2 -Wall -static -g -pthread
@@ -84,6 +87,7 @@ RESPONSE_TRANSFER_MODE="staging"
 CXL_NODE=1
 NUM_CPUS=0
 SERVER_CPU=-1
+RESTORE_CHECKPOINT=""
 TERMINAL_PORT=0
 GUEST_CFLAGS=""
 SKIP_IMAGE_SETUP=0
@@ -188,6 +192,10 @@ while [[ $# -gt 0 ]]; do
       SERVER_CPU="$2"
       shift 2
       ;;
+    --restore-checkpoint)
+      RESTORE_CHECKPOINT="$2"
+      shift 2
+      ;;
     --terminal-port)
       TERMINAL_PORT="$2"
       shift 2
@@ -245,6 +253,19 @@ if [[ "$ATOMIC_CHECKPOINT" -eq 1 ]]; then
   BOOT_CPU="ATOMIC"
 fi
 
+if [[ "$ATOMIC_CHECKPOINT" -eq 1 && -n "$RESTORE_CHECKPOINT" ]]; then
+  echo "--atomic-checkpoint and --restore-checkpoint are mutually exclusive" >&2
+  exit 1
+fi
+
+if [[ -n "$RESTORE_CHECKPOINT" ]]; then
+  if [[ ! -d "$RESTORE_CHECKPOINT" ]]; then
+    echo "restore checkpoint not found: $RESTORE_CHECKPOINT" >&2
+    exit 1
+  fi
+  RESTORE_CHECKPOINT="$(cd "$RESTORE_CHECKPOINT" && pwd)"
+fi
+
 EXPECTED_TOTAL_REQUESTS=$((CLIENT_COUNT * COUNT_PER_CLIENT))
 if [[ "$SLOW_CLIENT_COUNT" -gt 0 ]]; then
   EXPECTED_TOTAL_REQUESTS=$((EXPECTED_TOTAL_REQUESTS - SLOW_CLIENT_COUNT * (COUNT_PER_CLIENT - SLOW_COUNT_PER_CLIENT)))
@@ -267,7 +288,7 @@ PY
 )"
 fi
 
-if [[ "$BOOT_CPU" == "KVM" || "$SKIP_IMAGE_SETUP" -eq 0 ]]; then
+if [[ "$SKIP_IMAGE_SETUP" -eq 0 || ( -z "$RESTORE_CHECKPOINT" && "$BOOT_CPU" == "KVM" ) ]]; then
   if ! sudo -n true >/dev/null 2>&1; then
     echo "dedicated runner requires passwordless sudo or a live sudo ticket" >&2
     exit 1
@@ -279,6 +300,7 @@ OUTDIR="$(cd "$OUTDIR" && pwd)"
 
 GEM5_LOG="$OUTDIR/gem5.stdout"
 LOG_PATH="$OUTDIR/board.pc.com_1.device"
+RESULT_LOG_PATH="$OUTDIR/hydrarpc_dedicated.result.log"
 
 if [[ -z "$CHECKPOINT_ROOT" ]]; then
   CHECKPOINT_ROOT="$OUTDIR/checkpoints"
@@ -296,7 +318,7 @@ CHECKPOINT_BOOT_OUTDIR="$CHECKPOINT_BUNDLE/boot_run"
 CHECKPOINT_MARKER="$CHECKPOINT_BUNDLE/checkpoint.path"
 
 gem5_launcher=("$BINARY")
-if [[ "$BOOT_CPU" == "KVM" ]]; then
+if [[ -z "$RESTORE_CHECKPOINT" && "$BOOT_CPU" == "KVM" ]]; then
   gem5_launcher=(sudo -n "$BINARY")
 fi
 
@@ -313,7 +335,26 @@ RESTORE_WORKLOAD_FILE="$OUTDIR/hydrarpc_dedicated.restore.runscript"
   printf "#!/bin/sh\n"
   printf "set -eu\n"
   printf "exec >/dev/ttyS0 2>&1\n"
-  printf "/sbin/m5 exit\n"
+  printf "ready_tries=300\n"
+  printf "while [ \"\$ready_tries\" -gt 0 ]; do\n"
+  printf "  state=\$(systemctl is-system-running 2>/dev/null || true)\n"
+  printf "  if systemctl is-active --quiet multi-user.target; then\n"
+  printf "    case \"\$state\" in\n"
+  printf "      running|degraded)\n"
+  printf "        break\n"
+  printf "        ;;\n"
+  printf "    esac\n"
+  printf "  fi\n"
+  printf "  ready_tries=\$((ready_tries - 1))\n"
+  printf "  if [ \"\$ready_tries\" -eq 0 ]; then\n"
+  printf "    printf 'guest_ready_timeout state=%%s\\n' \"\$state\"\n"
+  printf "    exit 1\n"
+  printf "  fi\n"
+  printf "  sleep 1\n"
+  printf "done\n"
+  if [[ -z "$RESTORE_CHECKPOINT" ]]; then
+    printf "/sbin/m5 exit\n"
+  fi
   printf "set +e\n"
   printf "%s\n" "$GUEST_CMD"
   printf "rc=\$?\n"
@@ -442,6 +483,11 @@ if [[ "$ATOMIC_CHECKPOINT" -eq 1 ]]; then
     --restore-checkpoint "$RESTORE_CHECKPOINT_DIR"
     --workload-file "$RESTORE_WORKLOAD_FILE"
   )
+elif [[ -n "$RESTORE_CHECKPOINT" ]]; then
+  gem5_args+=(
+    --restore-checkpoint "$RESTORE_CHECKPOINT"
+    --workload-file "$RESTORE_WORKLOAD_FILE"
+  )
 else
   gem5_args+=(
     --boot_cpu "$BOOT_CPU"
@@ -456,14 +502,23 @@ if ! "${gem5_launcher[@]}" "${gem5_args[@]}" >"$GEM5_LOG" 2>&1; then
   exit 1
 fi
 
+if [[ ! -f "$RESULT_LOG_PATH" ]]; then
+  echo "missing result log: $RESULT_LOG_PATH" >&2
+  echo "=== board log tail ===" >&2
+  tail -n 80 "$LOG_PATH" >&2 || true
+  echo "=== gem5 log tail ===" >&2
+  tail -n 80 "$GEM5_LOG" >&2 || true
+  exit 1
+fi
+
 echo
 echo "=== Multi-client dedicated raw output ==="
 rg -n "^(server_loop_start_ts_ns=|client_[0-9]+_req_[0-9]+_(client_req_start_ts_ns|client_resp_done_ts_ns|server_req_observe_ts_ns|server_exec_done_ts_ns|server_resp_done_ts_ns)=|guest_command_rc=|benchmark_rc=)" \
-  "$LOG_PATH" | sed 's/^[0-9]*://' || true
+  "$RESULT_LOG_PATH" | sed 's/^[0-9]*://' || true
 echo
 echo "=== Multi-client dedicated summary ==="
 python3 tools/summarize_hydrarpc_multiclient.py \
-  --log "$LOG_PATH" \
+  --log "$RESULT_LOG_PATH" \
   --experiment dedicated \
   --client-count "$CLIENT_COUNT" \
   --count-per-client "$COUNT_PER_CLIENT" \

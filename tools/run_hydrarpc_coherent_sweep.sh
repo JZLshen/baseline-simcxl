@@ -26,6 +26,8 @@ Options:
   --response-transfer-mode <mode>
                            Response publish mode: staging or direct. Default: staging
   --num-cpus <N>           Guest CPU count passed to the runner. Default: auto
+  --restore-checkpoint <dir>
+                           Reuse an existing boot checkpoint for each run.
   --guest-cflags <flags>   Host gcc flags used for the injected guest binary.
   --skip-image-setup       Reuse the coherent dedicated guest binary already injected into the disk image.
   --parallel-jobs <N>      Number of runs to execute concurrently. Default: 1
@@ -51,6 +53,7 @@ SEND_GAP_NS=0
 REQUEST_TRANSFER_MODE="staging"
 RESPONSE_TRANSFER_MODE="staging"
 NUM_CPUS=0
+RESTORE_CHECKPOINT=""
 GUEST_CFLAGS=""
 SKIP_IMAGE_SETUP=0
 PARALLEL_JOBS=1
@@ -122,6 +125,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --num-cpus)
       NUM_CPUS="$2"
+      shift 2
+      ;;
+    --restore-checkpoint)
+      RESTORE_CHECKPOINT="$2"
       shift 2
       ;;
     --guest-cflags)
@@ -215,11 +222,6 @@ resolve_log_path() {
     return 0
   fi
 
-  if [[ -f "$outdir/board.pc.com_1.device" ]]; then
-    printf '%s\n' "$outdir/board.pc.com_1.device"
-    return 0
-  fi
-
   return 1
 }
 
@@ -247,15 +249,15 @@ is_transient_cpu_failure() {
 
 is_incomplete_guest_run() {
   local outdir="$1"
-  local board_log="$outdir/board.pc.com_1.device"
+  local result_log="$outdir/hydrarpc_dedicated_coherent.result.log"
   local console_log="$outdir/console.log"
 
-  if [[ ! -f "$board_log" ]]; then
+  if [[ ! -f "$result_log" ]]; then
     return 0
   fi
 
-  if rg -q '^benchmark_rc=0$' "$board_log" 2>/dev/null && \
-     rg -q '^guest_command_rc=0$' "$board_log" 2>/dev/null; then
+  if rg -q '^benchmark_rc=0$' "$result_log" 2>/dev/null && \
+     rg -q '^guest_command_rc=0$' "$result_log" 2>/dev/null; then
     return 1
   fi
 
@@ -264,11 +266,11 @@ is_incomplete_guest_run() {
     return 0
   fi
 
-  if ! rg -q '^benchmark_rc=' "$board_log" 2>/dev/null; then
+  if ! rg -q '^benchmark_rc=' "$result_log" 2>/dev/null; then
     return 0
   fi
 
-  if ! rg -q '^guest_command_rc=' "$board_log" 2>/dev/null; then
+  if ! rg -q '^guest_command_rc=' "$result_log" 2>/dev/null; then
     return 0
   fi
 
@@ -293,7 +295,7 @@ run_runner_only() {
   echo "[$(date '+%F %T')] START client_count=${client_count} outdir=${outdir}" \
     | tee -a "$RUN_LOG"
 
-  if [[ "$SKIP_EXISTING" -eq 1 && -f "$outdir/board.pc.com_1.device" ]]; then
+  if [[ "$SKIP_EXISTING" -eq 1 ]] && resolve_log_path "$outdir" >/dev/null 2>&1; then
     echo "[$(date '+%F %T')] REUSE-LOG client_count=${client_count} outdir=${outdir}" \
       | tee -a "$RUN_LOG"
     printf '0\n' >"$runner_rc_file"
@@ -315,6 +317,9 @@ run_runner_only() {
     )
     if [[ "$NUM_CPUS" -gt 0 ]]; then
       extra_args+=(--num-cpus "$NUM_CPUS")
+    fi
+    if [[ -n "$RESTORE_CHECKPOINT" ]]; then
+      extra_args+=(--restore-checkpoint "$RESTORE_CHECKPOINT")
     fi
     if [[ -n "$GUEST_CFLAGS" ]]; then
       extra_args+=(--guest-cflags "$GUEST_CFLAGS")
@@ -388,7 +393,7 @@ process_one() {
   if ! log_path="$(resolve_log_path "$outdir")"; then
     echo "[$(date '+%F %T')] MISSING-LOG client_count=${client_count} outdir=${outdir}" \
       | tee -a "$RUN_LOG"
-    record_failure "$client_count" "1" "$outdir" "missing_result_or_board_log"
+    record_failure "$client_count" "1" "$outdir" "missing_result_log"
     return 1
   fi
 

@@ -1043,6 +1043,7 @@ print_results_with_rc(FILE *stream,
                       struct RequestTimingData *timing)
 {
     fprintf(stream, "benchmark_rc=%d\n", rc);
+    fprintf(stream, "guest_command_rc=%d\n", rc);
     write_results(stream,
                   client_count,
                   request_count,
@@ -1051,9 +1052,70 @@ print_results_with_rc(FILE *stream,
                   timing);
 }
 
+static int
+write_host_result_log(const char *host_filename,
+                      int rc,
+                      uint64_t client_count,
+                      uint64_t request_count,
+                      uint64_t slow_client_count,
+                      uint64_t slow_request_count,
+                      struct RequestTimingData *timing)
+{
+    enum { WRITEFILE_CHUNK_BYTES = 256 * 1024 };
+    char *buffer = NULL;
+    size_t buffer_len = 0;
+    FILE *stream = open_memstream(&buffer, &buffer_len);
+    size_t offset = 0;
+    int failed = 0;
+
+    if (stream == NULL) {
+        fprintf(stderr, "open_memstream failed: %s\n", strerror(errno));
+        return 1;
+    }
+
+    print_results_with_rc(stream,
+                          rc,
+                          client_count,
+                          request_count,
+                          slow_client_count,
+                          slow_request_count,
+                          timing);
+
+    if (fclose(stream) != 0) {
+        fprintf(stderr, "closing result memstream failed: %s\n", strerror(errno));
+        free(buffer);
+        return 1;
+    }
+
+    while (offset < buffer_len) {
+        size_t chunk_len = buffer_len - offset;
+
+        if (chunk_len > WRITEFILE_CHUNK_BYTES)
+            chunk_len = WRITEFILE_CHUNK_BYTES;
+
+        if (m5_write_file(buffer + offset,
+                          chunk_len,
+                          offset,
+                          host_filename) != chunk_len) {
+            fprintf(stderr,
+                    "m5_write_file short write at offset=%zu chunk=%zu\n",
+                    offset,
+                    chunk_len);
+            failed = 1;
+            break;
+        }
+
+        offset += chunk_len;
+    }
+
+    free(buffer);
+    return failed;
+}
+
 int
 main(int argc, char **argv)
 {
+    static const char result_log_name[] = HYDRARPC_VARIANT_NAME ".result.log";
     uint64_t client_count = 1;
     uint64_t request_count = 30;
     uint64_t window_size = 16;
@@ -1445,13 +1507,16 @@ wait_children:
     if (control_has_error(control))
         rc = 1;
 
-    print_results_with_rc(stdout,
-                          rc,
-                          client_count,
-                          request_count,
-                          slow_client_count,
-                          slow_request_count,
-                          &timing);
+    if (write_host_result_log(result_log_name,
+                              rc,
+                              client_count,
+                              request_count,
+                              slow_client_count,
+                              slow_request_count,
+                              &timing) != 0) {
+        fprintf(stderr, "failed to write %s\n", result_log_name);
+        rc = 1;
+    }
 
 cleanup:
     if (connections != NULL) {

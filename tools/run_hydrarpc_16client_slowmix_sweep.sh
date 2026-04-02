@@ -244,7 +244,7 @@ PY
   runner_rc=$?
 
   python3 "$REPO_ROOT/tools/summarize_hydrarpc_multiclient.py" \
-    --log "$out/board.pc.com_1.device" \
+    --log "$out/hydrarpc_dedicated.result.log" \
     --experiment dedicated_slowmix \
     --client-count "$CLIENT_COUNT" \
     --count-per-client "$COUNT_PER_CLIENT" \

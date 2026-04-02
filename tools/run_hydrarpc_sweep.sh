@@ -27,6 +27,8 @@ Options:
   --response-transfer-mode <mode>
                            Dedicated response publish mode: staging or direct. Default: staging
   --num-cpus <N>           Guest CPU count passed to runners. Default: auto
+  --restore-checkpoint <dir>
+                           Reuse an existing boot checkpoint for each run.
   --guest-cflags <flags>   Host gcc flags used for the injected guest binaries.
   --skip-image-setup       Reuse the shared/dedicated guest binaries already injected into the disk image.
   --parallel-jobs <N>      Number of runs to execute concurrently. Default: 1
@@ -54,6 +56,7 @@ SEND_GAP_NS=0
 REQUEST_TRANSFER_MODE="staging"
 RESPONSE_TRANSFER_MODE="staging"
 NUM_CPUS=0
+RESTORE_CHECKPOINT=""
 GUEST_CFLAGS=""
 SKIP_IMAGE_SETUP=0
 PARALLEL_JOBS=1
@@ -130,6 +133,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --num-cpus)
       NUM_CPUS="$2"
+      shift 2
+      ;;
+    --restore-checkpoint)
+      RESTORE_CHECKPOINT="$2"
       shift 2
       ;;
     --guest-cflags)
@@ -250,11 +257,6 @@ resolve_log_path() {
     return 0
   fi
 
-  if [[ -f "$outdir/board.pc.com_1.device" ]]; then
-    printf '%s\n' "$outdir/board.pc.com_1.device"
-    return 0
-  fi
-
   return 1
 }
 
@@ -320,7 +322,7 @@ run_runner_only() {
   echo "[$(date '+%F %T')] START kind=${kind} client_count=${client_count} outdir=${outdir}" \
     | tee -a "$RUN_LOG"
 
-  if [[ "$SKIP_EXISTING" -eq 1 && -f "$outdir/board.pc.com_1.device" ]]; then
+  if [[ "$SKIP_EXISTING" -eq 1 ]] && resolve_log_path "$kind" "$outdir" >/dev/null 2>&1; then
     echo "[$(date '+%F %T')] REUSE-LOG kind=${kind} client_count=${client_count} outdir=${outdir}" \
       | tee -a "$RUN_LOG"
     printf '0\n' >"$runner_rc_file"
@@ -332,6 +334,9 @@ run_runner_only() {
     extra_args=()
     if [[ "$NUM_CPUS" -gt 0 ]]; then
       extra_args+=(--num-cpus "$NUM_CPUS")
+    fi
+    if [[ -n "$RESTORE_CHECKPOINT" ]]; then
+      extra_args+=(--restore-checkpoint "$RESTORE_CHECKPOINT")
     fi
     if [[ "$kind" == "dedicated" ]]; then
       extra_args+=(
@@ -446,7 +451,7 @@ process_one() {
   if ! log_path="$(resolve_log_path "$kind" "$outdir")"; then
     echo "[$(date '+%F %T')] MISSING-LOG kind=${kind} client_count=${client_count} outdir=${outdir}" \
       | tee -a "$RUN_LOG"
-    record_failure "$kind" "$client_count" "1" "$outdir" "missing_result_or_board_log"
+    record_failure "$kind" "$client_count" "1" "$outdir" "missing_result_log"
     return 1
   fi
 
