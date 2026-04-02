@@ -8,6 +8,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+export DISK_IMAGE="${DISK_IMAGE:-${REPO_ROOT}/files/parsec.img}"
 
 STAMP="${STAMP:-$(date +%Y%m%d_%H%M%S)}"
 ROOT_OUTDIR="${ROOT_OUTDIR:-${REPO_ROOT}/output/hydrarpc_motivation_${SERVER_TAG}_${STAMP}}"
@@ -63,9 +64,9 @@ ensure_dedicated_image() {
   ensure_build
   if [[ -n "$GUEST_CFLAGS" ]]; then
     run_cmd env HYDRARPC_GUEST_CFLAGS="$GUEST_CFLAGS" \
-      bash tools/setup_hydrarpc_dedicated_disk_image.sh files/parsec.img
+      bash tools/setup_hydrarpc_dedicated_disk_image.sh "$DISK_IMAGE"
   else
-    run_cmd bash tools/setup_hydrarpc_dedicated_disk_image.sh files/parsec.img
+    run_cmd bash tools/setup_hydrarpc_dedicated_disk_image.sh "$DISK_IMAGE"
   fi
   DEDICATED_READY=1
 }
@@ -78,9 +79,9 @@ ensure_shared_image() {
   ensure_build
   if [[ -n "$GUEST_CFLAGS" ]]; then
     run_cmd env HYDRARPC_GUEST_CFLAGS="$GUEST_CFLAGS" \
-      bash tools/setup_hydrarpc_shared_disk_image.sh files/parsec.img
+      bash tools/setup_hydrarpc_shared_disk_image.sh "$DISK_IMAGE"
   else
-    run_cmd bash tools/setup_hydrarpc_shared_disk_image.sh files/parsec.img
+    run_cmd bash tools/setup_hydrarpc_shared_disk_image.sh "$DISK_IMAGE"
   fi
   SHARED_READY=1
 }
@@ -93,9 +94,9 @@ ensure_coherent_image() {
   ensure_build
   if [[ -n "$GUEST_CFLAGS" ]]; then
     run_cmd env HYDRARPC_GUEST_CFLAGS="$GUEST_CFLAGS" \
-      bash tools/setup_hydrarpc_dedicated_coherent_disk_image.sh files/parsec.img
+      bash tools/setup_hydrarpc_dedicated_coherent_disk_image.sh "$DISK_IMAGE"
   else
-    run_cmd bash tools/setup_hydrarpc_dedicated_coherent_disk_image.sh files/parsec.img
+    run_cmd bash tools/setup_hydrarpc_dedicated_coherent_disk_image.sh "$DISK_IMAGE"
   fi
   COHERENT_READY=1
 }

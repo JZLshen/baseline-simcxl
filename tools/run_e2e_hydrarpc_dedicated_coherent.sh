@@ -54,7 +54,7 @@ EOF
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 KERNEL="${REPO_ROOT}/files/vmlinux"
-DISK_IMAGE="${REPO_ROOT}/files/parsec.img"
+export DISK_IMAGE="${DISK_IMAGE:-${REPO_ROOT}/files/parsec.img}"
 
 OUTDIR="output/hydrarpc_dedicated_coherent_run"
 BINARY="build/X86/gem5.opt"

@@ -177,6 +177,7 @@ done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+export DISK_IMAGE="${DISK_IMAGE:-${REPO_ROOT}/files/parsec.img}"
 cd "$REPO_ROOT"
 
 if [[ -z "$ROOT_OUTDIR" ]]; then
@@ -190,18 +191,18 @@ fi
 if [[ "$KINDS" == *"dedicated"* && "$SKIP_IMAGE_SETUP" -eq 0 ]]; then
   if [[ -n "$GUEST_CFLAGS" ]]; then
     HYDRARPC_GUEST_CFLAGS="$GUEST_CFLAGS" \
-      bash tools/setup_hydrarpc_dedicated_disk_image.sh files/parsec.img
+      bash tools/setup_hydrarpc_dedicated_disk_image.sh "$DISK_IMAGE"
   else
-    bash tools/setup_hydrarpc_dedicated_disk_image.sh files/parsec.img
+    bash tools/setup_hydrarpc_dedicated_disk_image.sh "$DISK_IMAGE"
   fi
 fi
 
 if [[ "$KINDS" == *"shared"* && "$SKIP_IMAGE_SETUP" -eq 0 ]]; then
   if [[ -n "$GUEST_CFLAGS" ]]; then
     HYDRARPC_GUEST_CFLAGS="$GUEST_CFLAGS" \
-      bash tools/setup_hydrarpc_shared_disk_image.sh files/parsec.img
+      bash tools/setup_hydrarpc_shared_disk_image.sh "$DISK_IMAGE"
   else
-    bash tools/setup_hydrarpc_shared_disk_image.sh files/parsec.img
+    bash tools/setup_hydrarpc_shared_disk_image.sh "$DISK_IMAGE"
   fi
 fi
 
