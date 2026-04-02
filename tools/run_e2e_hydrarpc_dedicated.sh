@@ -11,6 +11,13 @@ Options:
   --binary <path>          gem5 binary. Default: build/X86/gem5.opt
   --cpu-type <type>        Switch CPU type: TIMING or O3. Default: TIMING
   --boot-cpu <type>        Boot CPU type before the first m5 exit: KVM or ATOMIC. Default: KVM
+  --atomic-checkpoint      Boot once with ATOMIC, save/reuse a boot checkpoint,
+                           then restore directly with CPU_TYPE to run the guest workload.
+  --checkpoint-root <dir>  Root directory for reusable boot checkpoints.
+                           Default with --atomic-checkpoint: <outdir>/checkpoints
+  --checkpoint-id <id>     Checkpoint bundle name under --checkpoint-root.
+                           Default: atomic_n<num-cpus>
+  --refresh-checkpoint     Regenerate the selected boot checkpoint bundle.
   --client-count <N>       Number of client processes. Default: 1
   --count-per-client <N>   Requests per client. Default: 30
   --window-size <N>        Max outstanding requests per client. Default: 16
@@ -57,6 +64,10 @@ OUTDIR="output/hydrarpc_dedicated_run"
 BINARY="build/X86/gem5.opt"
 CPU_TYPE="TIMING"
 BOOT_CPU="KVM"
+ATOMIC_CHECKPOINT=0
+CHECKPOINT_ROOT=""
+CHECKPOINT_ID=""
+REFRESH_CHECKPOINT=0
 CLIENT_COUNT=1
 COUNT_PER_CLIENT=30
 WINDOW_SIZE=16
@@ -96,6 +107,22 @@ while [[ $# -gt 0 ]]; do
     --boot-cpu)
       BOOT_CPU="$2"
       shift 2
+      ;;
+    --atomic-checkpoint)
+      ATOMIC_CHECKPOINT=1
+      shift 1
+      ;;
+    --checkpoint-root)
+      CHECKPOINT_ROOT="$2"
+      shift 2
+      ;;
+    --checkpoint-id)
+      CHECKPOINT_ID="$2"
+      shift 2
+      ;;
+    --refresh-checkpoint)
+      REFRESH_CHECKPOINT=1
+      shift 1
       ;;
     --client-count)
       CLIENT_COUNT="$2"
@@ -214,6 +241,10 @@ if [[ "$SERVER_CPU" -lt 0 ]]; then
   SERVER_CPU="$CLIENT_COUNT"
 fi
 
+if [[ "$ATOMIC_CHECKPOINT" -eq 1 ]]; then
+  BOOT_CPU="ATOMIC"
+fi
+
 EXPECTED_TOTAL_REQUESTS=$((CLIENT_COUNT * COUNT_PER_CLIENT))
 if [[ "$SLOW_CLIENT_COUNT" -gt 0 ]]; then
   EXPECTED_TOTAL_REQUESTS=$((EXPECTED_TOTAL_REQUESTS - SLOW_CLIENT_COUNT * (COUNT_PER_CLIENT - SLOW_COUNT_PER_CLIENT)))
@@ -249,6 +280,21 @@ OUTDIR="$(cd "$OUTDIR" && pwd)"
 GEM5_LOG="$OUTDIR/gem5.stdout"
 LOG_PATH="$OUTDIR/board.pc.com_1.device"
 
+if [[ -z "$CHECKPOINT_ROOT" ]]; then
+  CHECKPOINT_ROOT="$OUTDIR/checkpoints"
+fi
+
+mkdir -p "$CHECKPOINT_ROOT"
+CHECKPOINT_ROOT="$(cd "$CHECKPOINT_ROOT" && pwd)"
+
+if [[ -z "$CHECKPOINT_ID" ]]; then
+  CHECKPOINT_ID="atomic_n${NUM_CPUS}"
+fi
+
+CHECKPOINT_BUNDLE="$CHECKPOINT_ROOT/$CHECKPOINT_ID"
+CHECKPOINT_BOOT_OUTDIR="$CHECKPOINT_BUNDLE/boot_run"
+CHECKPOINT_MARKER="$CHECKPOINT_BUNDLE/checkpoint.path"
+
 gem5_launcher=("$BINARY")
 if [[ "$BOOT_CPU" == "KVM" ]]; then
   gem5_launcher=(sudo -n "$BINARY")
@@ -261,6 +307,7 @@ fi
 
 GUEST_CMD="/home/test_code/run_hydrarpc_dedicated.sh --client-count ${CLIENT_COUNT} --count-per-client ${COUNT_PER_CLIENT} --window-size ${WINDOW_SIZE} --slot-count ${SLOT_COUNT} --req-bytes ${REQ_BYTES} --resp-bytes ${RESP_BYTES} --slow-client-count ${SLOW_CLIENT_COUNT} --slow-count-per-client ${SLOW_COUNT_PER_CLIENT} --slow-send-gap-ns ${SLOW_SEND_GAP_NS} --send-mode ${SEND_MODE} --send-gap-ns ${SEND_GAP_NS} --request-transfer-mode ${REQUEST_TRANSFER_MODE} --response-transfer-mode ${RESPONSE_TRANSFER_MODE} --cxl-node ${CXL_NODE} --server-cpu ${SERVER_CPU}"
 WORKLOAD_FILE="$OUTDIR/hydrarpc_dedicated.runscript"
+RESTORE_WORKLOAD_FILE="$OUTDIR/hydrarpc_dedicated.restore.runscript"
 
 {
   printf "#!/bin/sh\n"
@@ -274,6 +321,102 @@ WORKLOAD_FILE="$OUTDIR/hydrarpc_dedicated.runscript"
   printf "/sbin/m5 exit\n"
 } > "$WORKLOAD_FILE"
 
+{
+  printf "#!/bin/sh\n"
+  printf "set -eu\n"
+  printf "exec >/dev/ttyS0 2>&1\n"
+  printf "set +e\n"
+  printf "%s\n" "$GUEST_CMD"
+  printf "rc=\$?\n"
+  printf "printf 'guest_command_rc=%%s\\\\n' \"\$rc\"\n"
+  printf "/sbin/m5 exit\n"
+} > "$RESTORE_WORKLOAD_FILE"
+
+resolve_checkpoint_dir() {
+  local checkpoint_dir=""
+
+  if [[ -f "$CHECKPOINT_MARKER" ]]; then
+    checkpoint_dir="$(<"$CHECKPOINT_MARKER")"
+    if [[ -d "$checkpoint_dir" ]]; then
+      printf '%s\n' "$checkpoint_dir"
+      return 0
+    fi
+  fi
+
+  shopt -s nullglob
+  local candidates=("$CHECKPOINT_BOOT_OUTDIR"/cpt.*)
+  shopt -u nullglob
+
+  if [[ "${#candidates[@]}" -eq 0 ]]; then
+    return 1
+  fi
+
+  checkpoint_dir="$(printf '%s\n' "${candidates[@]}" | sort | tail -n 1)"
+  if [[ -d "$checkpoint_dir" ]]; then
+    printf '%s\n' "$checkpoint_dir"
+    return 0
+  fi
+
+  return 1
+}
+
+write_checkpoint_marker() {
+  local checkpoint_dir="$1"
+  mkdir -p "$CHECKPOINT_BUNDLE"
+  printf '%s\n' "$checkpoint_dir" > "$CHECKPOINT_MARKER"
+}
+
+ensure_boot_checkpoint() {
+  local checkpoint_dir=""
+  local boot_log=""
+  local boot_args=()
+
+  if [[ "$ATOMIC_CHECKPOINT" -eq 0 ]]; then
+    return 0
+  fi
+
+  if [[ "$REFRESH_CHECKPOINT" -eq 1 ]]; then
+    rm -rf "$CHECKPOINT_BUNDLE"
+  fi
+
+  if checkpoint_dir="$(resolve_checkpoint_dir)"; then
+    printf 'Reusing boot checkpoint: %s\n' "$checkpoint_dir"
+    write_checkpoint_marker "$checkpoint_dir"
+    return 0
+  fi
+
+  mkdir -p "$CHECKPOINT_BOOT_OUTDIR"
+  boot_log="$CHECKPOINT_BOOT_OUTDIR/gem5.stdout"
+
+  boot_args=(
+    -d "$CHECKPOINT_BOOT_OUTDIR"
+    configs/example/gem5_library/x86-cxl-type3-with-classic.py
+    --is_asic True
+    --cpu_type "$CPU_TYPE"
+    --boot_cpu ATOMIC
+    --checkpoint-boot
+    --num_cpus "$NUM_CPUS"
+    --kernel "$KERNEL"
+    --disk-image "$DISK_IMAGE"
+    --terminal-port 0
+  )
+
+  if ! "$BINARY" "${boot_args[@]}" >"$boot_log" 2>&1; then
+    echo "boot checkpoint generation failed" >&2
+    echo "=== boot checkpoint gem5 log ===" >&2
+    tail -n 200 "$boot_log" >&2 || true
+    exit 1
+  fi
+
+  if ! checkpoint_dir="$(resolve_checkpoint_dir)"; then
+    echo "boot checkpoint generation completed but no checkpoint directory was found" >&2
+    exit 1
+  fi
+
+  write_checkpoint_marker "$checkpoint_dir"
+  printf 'Created boot checkpoint: %s\n' "$checkpoint_dir"
+}
+
 gem5_args=(
   -d "$OUTDIR"
 )
@@ -286,13 +429,25 @@ gem5_args+=(
   configs/example/gem5_library/x86-cxl-type3-with-classic.py
   --is_asic True
   --cpu_type "$CPU_TYPE"
-  --boot_cpu "$BOOT_CPU"
   --num_cpus "$NUM_CPUS"
   --kernel "$KERNEL"
   --disk-image "$DISK_IMAGE"
-  --workload-file "$WORKLOAD_FILE"
   --terminal-port "$TERMINAL_PORT"
 )
+
+if [[ "$ATOMIC_CHECKPOINT" -eq 1 ]]; then
+  ensure_boot_checkpoint
+  RESTORE_CHECKPOINT_DIR="$(<"$CHECKPOINT_MARKER")"
+  gem5_args+=(
+    --restore-checkpoint "$RESTORE_CHECKPOINT_DIR"
+    --workload-file "$RESTORE_WORKLOAD_FILE"
+  )
+else
+  gem5_args+=(
+    --boot_cpu "$BOOT_CPU"
+    --workload-file "$WORKLOAD_FILE"
+  )
+fi
 
 if ! "${gem5_launcher[@]}" "${gem5_args[@]}" >"$GEM5_LOG" 2>&1; then
   echo "gem5 run failed" >&2
@@ -314,4 +469,7 @@ python3 tools/summarize_hydrarpc_multiclient.py \
   --count-per-client "$COUNT_PER_CLIENT" \
   --expected-total-requests "$EXPECTED_TOTAL_REQUESTS"
 echo
+if [[ "$ATOMIC_CHECKPOINT" -eq 1 ]]; then
+  echo "Checkpoint bundle: $CHECKPOINT_BUNDLE"
+fi
 echo "Output dir: $OUTDIR"
