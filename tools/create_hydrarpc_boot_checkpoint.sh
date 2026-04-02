@@ -16,7 +16,7 @@ Options:
                            Default: 34
   --kernel <path>          Kernel image. Default: repo-local files/vmlinux
   --disk-image <path>      Disk image. Default: repo-local files/parsec.img
-  --terminal-port <N>      Terminal port. Default: 0
+  --terminal-port <N>      Terminal port. Default: auto-pick
   --skip-build             Skip scons build.
   --help                   Show this message.
 
@@ -110,6 +110,17 @@ cd "$REPO_ROOT"
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
   scons "$BINARY" -j"$(nproc)"
+fi
+
+if [[ "$TERMINAL_PORT" -eq 0 ]]; then
+  TERMINAL_PORT="$(python3 - <<'PY'
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
+)"
 fi
 
 if [[ "$BOOT_CPU" == "KVM" ]]; then

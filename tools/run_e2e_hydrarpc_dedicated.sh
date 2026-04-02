@@ -410,6 +410,7 @@ write_checkpoint_marker() {
 ensure_boot_checkpoint() {
   local checkpoint_dir=""
   local boot_log=""
+  local boot_terminal_port=0
   local boot_args=()
 
   if [[ "$ATOMIC_CHECKPOINT" -eq 0 ]]; then
@@ -428,6 +429,14 @@ ensure_boot_checkpoint() {
 
   mkdir -p "$CHECKPOINT_BOOT_OUTDIR"
   boot_log="$CHECKPOINT_BOOT_OUTDIR/gem5.stdout"
+  boot_terminal_port="$(python3 - <<'PY'
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
+)"
 
   boot_args=(
     -d "$CHECKPOINT_BOOT_OUTDIR"
@@ -439,7 +448,7 @@ ensure_boot_checkpoint() {
     --num_cpus "$NUM_CPUS"
     --kernel "$KERNEL"
     --disk-image "$DISK_IMAGE"
-    --terminal-port 0
+    --terminal-port "$boot_terminal_port"
   )
 
   if ! "$BINARY" "${boot_args[@]}" >"$boot_log" 2>&1; then
