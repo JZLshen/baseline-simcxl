@@ -110,6 +110,12 @@ cd "$REPO_ROOT"
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
   scons "$BINARY" -j"$(nproc)"
+else
+  bash tools/check_gem5_binary_freshness.sh \
+    --binary "$BINARY" \
+    --label "gem5 binary for checkpoint mode=$MODE" \
+    --monitor "$CONFIG_PATH" \
+    --monitor "src/python/gem5/components/boards/x86_board.py"
 fi
 
 if [[ "$TERMINAL_PORT" -eq 0 ]]; then

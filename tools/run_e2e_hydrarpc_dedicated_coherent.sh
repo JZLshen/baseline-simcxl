@@ -239,6 +239,12 @@ cd "$REPO_ROOT"
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
   scons "$BINARY" -j"$(nproc)"
+else
+  bash tools/check_gem5_binary_freshness.sh \
+    --binary "$BINARY" \
+    --label "gem5 binary for coherent dedicated runner" \
+    --monitor "configs/example/gem5_library/x86-cxl-type3-with-ruby-local.py" \
+    --monitor "src/python/gem5/components/boards/x86_board.py"
 fi
 
 if [[ "$TERMINAL_PORT" -eq 0 ]]; then
@@ -278,6 +284,7 @@ fi
 
 GUEST_CMD="/home/test_code/run_hydrarpc_dedicated_coherent.sh --client-count ${CLIENT_COUNT} --count-per-client ${COUNT_PER_CLIENT} --window-size ${WINDOW_SIZE} --slot-count ${SLOT_COUNT} --req-bytes ${REQ_BYTES} --resp-bytes ${RESP_BYTES} --slow-client-count ${SLOW_CLIENT_COUNT} --slow-count-per-client ${SLOW_COUNT_PER_CLIENT} --slow-send-gap-ns ${SLOW_SEND_GAP_NS} --send-mode ${SEND_MODE} --send-gap-ns ${SEND_GAP_NS} --request-transfer-mode ${REQUEST_TRANSFER_MODE} --response-transfer-mode ${RESPONSE_TRANSFER_MODE} --cxl-node ${CXL_NODE} --server-cpu ${SERVER_CPU}"
 WORKLOAD_FILE="$OUTDIR/hydrarpc_dedicated_coherent.runscript"
+RESTORE_WORKLOAD_FILE="$OUTDIR/hydrarpc_dedicated_coherent.restore.runscript"
 
 {
   printf "#!/bin/sh\n"
@@ -310,6 +317,17 @@ WORKLOAD_FILE="$OUTDIR/hydrarpc_dedicated_coherent.runscript"
   printf "/sbin/m5 exit\n"
 } > "$WORKLOAD_FILE"
 
+{
+  printf "#!/bin/sh\n"
+  printf "set -eu\n"
+  printf "exec >/dev/ttyS0 2>&1\n"
+  printf "set +e\n"
+  printf "%s\n" "$GUEST_CMD"
+  printf "rc=\$?\n"
+  printf "printf 'guest_command_rc=%%s\\\\n' \"\$rc\"\n"
+  printf "/sbin/m5 exit\n"
+} > "$RESTORE_WORKLOAD_FILE"
+
 gem5_args=(
   -d "$OUTDIR"
 )
@@ -325,14 +343,19 @@ gem5_args+=(
   --num_cpus "$NUM_CPUS"
   --kernel "$KERNEL"
   --disk-image "$DISK_IMAGE"
-  --workload-file "$WORKLOAD_FILE"
   --terminal-port "$TERMINAL_PORT"
 )
 
 if [[ -n "$RESTORE_CHECKPOINT" ]]; then
-  gem5_args+=(--restore-checkpoint "$RESTORE_CHECKPOINT")
+  gem5_args+=(
+    --restore-checkpoint "$RESTORE_CHECKPOINT"
+    --workload-file "$RESTORE_WORKLOAD_FILE"
+  )
 else
-  gem5_args+=(--boot_cpu "$BOOT_CPU")
+  gem5_args+=(
+    --boot_cpu "$BOOT_CPU"
+    --workload-file "$WORKLOAD_FILE"
+  )
 fi
 
 if ! "${gem5_launcher[@]}" "${gem5_args[@]}" >"$GEM5_LOG" 2>&1; then

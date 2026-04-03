@@ -32,6 +32,7 @@ Options:
   --skip-image-setup       Reuse the coherent dedicated guest binary already injected into the disk image.
   --parallel-jobs <N>      Number of runs to execute concurrently. Default: 1
   --skip-build             Skip the top-level scons build.
+  --continue-on-failure    Record failed runs and continue the sweep.
   --skip-existing          Reuse existing outdirs and summary rows when possible.
   --help                   Show this message.
 EOF
@@ -58,8 +59,10 @@ GUEST_CFLAGS=""
 SKIP_IMAGE_SETUP=0
 PARALLEL_JOBS=1
 SKIP_BUILD=0
+CONTINUE_ON_FAILURE=0
 SKIP_EXISTING=0
 DROP_FIRST_PER_CLIENT=5
+ANY_FAILURES=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -147,6 +150,10 @@ while [[ $# -gt 0 ]]; do
       SKIP_BUILD=1
       shift 1
       ;;
+    --continue-on-failure)
+      CONTINUE_ON_FAILURE=1
+      shift 1
+      ;;
     --skip-existing)
       SKIP_EXISTING=1
       shift 1
@@ -174,6 +181,12 @@ fi
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
   scons build/X86/gem5.opt -j"$(nproc)"
+else
+  bash tools/check_gem5_binary_freshness.sh \
+    --binary "build/X86/gem5.opt" \
+    --label "gem5 binary for coherent sweep" \
+    --monitor "configs/example/gem5_library/x86-cxl-type3-with-ruby-local.py" \
+    --monitor "src/python/gem5/components/boards/x86_board.py"
 fi
 
 if [[ "$SKIP_IMAGE_SETUP" -eq 0 ]]; then
@@ -191,8 +204,15 @@ STEADY_CSV="$ROOT_OUTDIR/steady_summary.csv"
 FAIL_CSV="$ROOT_OUTDIR/failures.csv"
 RUN_LOG="$ROOT_OUTDIR/run.log"
 RUN_FAILURES_TSV="$ROOT_OUTDIR/run_failures.tsv"
-rm -f "$SUMMARY_CSV" "$STEADY_CSV" "$FAIL_CSV" "$RUN_FAILURES_TSV"
-: >"$RUN_LOG"
+rm -f "$FAIL_CSV" "$RUN_FAILURES_TSV"
+touch "$RUN_LOG"
+
+has_success_result_json() {
+  local result_json="$1"
+
+  [[ -f "$result_json" ]] || return 1
+  rg -q '"status"[[:space:]]*:[[:space:]]*"success"' "$result_json" 2>/dev/null
+}
 
 record_failure() {
   local client_count="$1"
@@ -278,6 +298,20 @@ is_incomplete_guest_run() {
   return 1
 }
 
+archive_retry_outdir() {
+  local outdir="$1"
+  local attempt="$2"
+  local retry_outdir="${outdir}.retry${attempt}"
+  local suffix=1
+
+  while [[ -e "$retry_outdir" ]]; do
+    retry_outdir="${outdir}.retry${attempt}.rerun${suffix}"
+    suffix=$((suffix + 1))
+  done
+
+  mv "$outdir" "$retry_outdir"
+}
+
 run_runner_only() {
   local client_count="$1"
   local outdir=""
@@ -348,7 +382,7 @@ run_runner_only() {
     if [[ "$attempt" -lt "$max_attempts" ]] && is_transient_cpu_failure "$outdir"; then
       echo "[$(date '+%F %T')] RETRY client_count=${client_count} attempt=${attempt} reason=transient_guest_cpu_failure" \
         | tee -a "$RUN_LOG"
-      mv "$outdir" "${outdir}.retry${attempt}"
+      archive_retry_outdir "$outdir" "$attempt"
       attempt=$((attempt + 1))
       continue
     fi
@@ -356,7 +390,7 @@ run_runner_only() {
     if [[ "$attempt" -lt "$max_attempts" ]] && is_incomplete_guest_run "$outdir"; then
       echo "[$(date '+%F %T')] RETRY client_count=${client_count} attempt=${attempt} reason=incomplete_guest_run" \
         | tee -a "$RUN_LOG"
-      mv "$outdir" "${outdir}.retry${attempt}"
+      archive_retry_outdir "$outdir" "$attempt"
       attempt=$((attempt + 1))
       continue
     fi
@@ -376,26 +410,31 @@ process_one() {
   local summary_rc=0
   local runner_rc=0
   local runner_rc_file=""
+  local result_json_path=""
 
   outdir="$(run_outdir "$client_count")"
   runner_rc_file="$outdir/runner.exitcode"
+  result_json_path="$outdir/result.json"
 
   if [[ -f "$runner_rc_file" ]]; then
     runner_rc="$(<"$runner_rc_file")"
   fi
 
-  if [[ "$runner_rc" -ne 0 ]]; then
-    echo "[$(date '+%F %T')] RUN-FAIL client_count=${client_count} rc=${runner_rc} outdir=${outdir}" \
-      | tee -a "$RUN_LOG"
-    record_failure "$client_count" "$runner_rc" "$outdir" "runner_failed"
-    return 1
-  fi
-
   if ! log_path="$(resolve_log_path "$outdir")"; then
+    if [[ "$runner_rc" -ne 0 ]]; then
+      echo "[$(date '+%F %T')] RUN-FAIL client_count=${client_count} rc=${runner_rc} outdir=${outdir}" \
+        | tee -a "$RUN_LOG"
+    fi
     echo "[$(date '+%F %T')] MISSING-LOG client_count=${client_count} outdir=${outdir}" \
       | tee -a "$RUN_LOG"
     record_failure "$client_count" "1" "$outdir" "missing_result_log"
     return 1
+  fi
+
+  if [[ "$SKIP_EXISTING" -eq 1 ]] && has_success_result_json "$result_json_path"; then
+    echo "[$(date '+%F %T')] REUSE-SUMMARY client_count=${client_count} outdir=${outdir}" \
+      | tee -a "$RUN_LOG"
+    return 0
   fi
 
   expected_total_requests=$((client_count * COUNT_PER_CLIENT))
@@ -422,6 +461,10 @@ process_one() {
   set -e
 
   if [[ "$summary_rc" -ne 0 ]]; then
+    if [[ "$runner_rc" -ne 0 ]]; then
+      echo "[$(date '+%F %T')] RUN-FAIL client_count=${client_count} rc=${runner_rc} outdir=${outdir}" \
+        | tee -a "$RUN_LOG"
+    fi
     echo "[$(date '+%F %T')] SUMMARY-FAIL client_count=${client_count} rc=${summary_rc} outdir=${outdir}" \
       | tee -a "$RUN_LOG"
     printf '%s\n' "$summary_text" | tee -a "$RUN_LOG"
@@ -429,6 +472,10 @@ process_one() {
     return 1
   fi
 
+  if [[ "$runner_rc" -ne 0 ]]; then
+    echo "[$(date '+%F %T')] SALVAGED-SUCCESS client_count=${client_count} runner_rc=${runner_rc} outdir=${outdir}" \
+      | tee -a "$RUN_LOG"
+  fi
   printf '%s\n' "$summary_text" | tee -a "$RUN_LOG"
   echo "[$(date '+%F %T')] END client_count=${client_count} outdir=${outdir}" \
     | tee -a "$RUN_LOG"
@@ -452,6 +499,12 @@ wait_for_background_or_fail() {
   set -e
 
   if [[ "$wait_rc" -ne 0 ]]; then
+    ANY_FAILURES=1
+    if [[ "$CONTINUE_ON_FAILURE" -eq 1 ]]; then
+      echo "[$(date '+%F %T')] CONTINUE-FAIL background job rc=${wait_rc}; continuing remaining sweep work" \
+        | tee -a "$RUN_LOG"
+      return 0
+    fi
     jobs -pr | xargs -r kill 2>/dev/null || true
     wait || true
     echo "[$(date '+%F %T')] FAIL-FAST aborting sweep after background failure" \
@@ -472,13 +525,27 @@ if [[ "$PARALLEL_JOBS" -gt 1 ]]; then
   done
 else
   for client_count in $CLIENT_COUNTS; do
-    run_runner_only "$client_count"
-    process_one "$client_count"
+    if ! run_runner_only "$client_count"; then
+      ANY_FAILURES=1
+      if [[ "$CONTINUE_ON_FAILURE" -eq 0 ]]; then
+        exit 1
+      fi
+    fi
+    if ! process_one "$client_count"; then
+      ANY_FAILURES=1
+      if [[ "$CONTINUE_ON_FAILURE" -eq 0 ]]; then
+        exit 1
+      fi
+    fi
   done
 fi
 
 echo
-echo "Sweep complete."
+if [[ "$ANY_FAILURES" -ne 0 ]]; then
+  echo "Sweep complete with failures."
+else
+  echo "Sweep complete."
+fi
 echo "root_outdir=$ROOT_OUTDIR"
 echo "summary_csv=$SUMMARY_CSV"
 echo "steady_csv=$STEADY_CSV"

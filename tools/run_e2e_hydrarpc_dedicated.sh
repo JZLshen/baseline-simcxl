@@ -24,6 +24,10 @@ Options:
   --slot-count <N>         Per-client ring depth. Default: 1024
   --req-bytes <N>          Request payload bytes. Default: 64
   --resp-bytes <N>         Response payload bytes. Default: 64
+  --req-min-bytes <N>      Optional minimum request payload size for per-request uniform bins.
+  --req-max-bytes <N>      Optional maximum request payload size for per-request uniform bins.
+  --resp-min-bytes <N>     Optional minimum response payload size for per-request uniform bins.
+  --resp-max-bytes <N>     Optional maximum response payload size for per-request uniform bins.
   --slow-client-count <N>  Mark the first N client ids as slow. Default: 0
   --slow-count-per-client <N>
                            Request count used by each slow client.
@@ -37,9 +41,17 @@ Options:
   --cxl-node <N>           NUMA node used for CXL mappings inside guest. Default: 1
   --num-cpus <N>           Guest CPU count. Default: client-count + 2
   --server-cpu <N>         Server CPU id. Default: client-count
+  --cxl-bridge-extra-latency <lat>
+                           Extra host-side CXL bridge latency passed to gem5.
+                           Default: 0ns
   --restore-checkpoint <dir>
                            Restore from an existing boot checkpoint and start
                            directly with CPU_TYPE cores.
+  --guest-cmd <cmd>        Override the guest-side command launched after boot.
+                           Default: run_hydrarpc_dedicated.sh with the current
+                           microbenchmark arguments.
+  --result-log-name <name> Guest-visible result log filename copied into OUTDIR.
+                           Default: hydrarpc_dedicated.result.log
   --terminal-port <N>      Host TCP port reserved for the guest COM1 listener. Default: auto-pick
   --guest-cflags <flags>   Host gcc flags used to build the injected guest binary.
                            Default: -O2 -Wall -static -g -pthread
@@ -77,6 +89,10 @@ WINDOW_SIZE=16
 SLOT_COUNT=1024
 REQ_BYTES=64
 RESP_BYTES=64
+REQ_MIN_BYTES=""
+REQ_MAX_BYTES=""
+RESP_MIN_BYTES=""
+RESP_MAX_BYTES=""
 SLOW_CLIENT_COUNT=0
 SLOW_COUNT_PER_CLIENT=0
 SLOW_SEND_GAP_NS=0
@@ -87,7 +103,10 @@ RESPONSE_TRANSFER_MODE="staging"
 CXL_NODE=1
 NUM_CPUS=0
 SERVER_CPU=-1
+CXL_BRIDGE_EXTRA_LATENCY="0ns"
 RESTORE_CHECKPOINT=""
+GUEST_CMD_OVERRIDE=""
+RESULT_LOG_NAME="hydrarpc_dedicated.result.log"
 TERMINAL_PORT=0
 GUEST_CFLAGS=""
 SKIP_IMAGE_SETUP=0
@@ -152,6 +171,22 @@ while [[ $# -gt 0 ]]; do
       RESP_BYTES="$2"
       shift 2
       ;;
+    --req-min-bytes)
+      REQ_MIN_BYTES="$2"
+      shift 2
+      ;;
+    --req-max-bytes)
+      REQ_MAX_BYTES="$2"
+      shift 2
+      ;;
+    --resp-min-bytes)
+      RESP_MIN_BYTES="$2"
+      shift 2
+      ;;
+    --resp-max-bytes)
+      RESP_MAX_BYTES="$2"
+      shift 2
+      ;;
     --slow-client-count)
       SLOW_CLIENT_COUNT="$2"
       shift 2
@@ -192,8 +227,20 @@ while [[ $# -gt 0 ]]; do
       SERVER_CPU="$2"
       shift 2
       ;;
+    --cxl-bridge-extra-latency)
+      CXL_BRIDGE_EXTRA_LATENCY="$2"
+      shift 2
+      ;;
     --restore-checkpoint)
       RESTORE_CHECKPOINT="$2"
+      shift 2
+      ;;
+    --guest-cmd)
+      GUEST_CMD_OVERRIDE="$2"
+      shift 2
+      ;;
+    --result-log-name)
+      RESULT_LOG_NAME="$2"
       shift 2
       ;;
     --terminal-port)
@@ -275,6 +322,12 @@ cd "$REPO_ROOT"
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
   scons "$BINARY" -j"$(nproc)"
+else
+  bash tools/check_gem5_binary_freshness.sh \
+    --binary "$BINARY" \
+    --label "gem5 binary for dedicated runner" \
+    --monitor "configs/example/gem5_library/x86-cxl-type3-with-classic.py" \
+    --monitor "src/python/gem5/components/boards/x86_board.py"
 fi
 
 if [[ "$TERMINAL_PORT" -eq 0 ]]; then
@@ -300,7 +353,7 @@ OUTDIR="$(cd "$OUTDIR" && pwd)"
 
 GEM5_LOG="$OUTDIR/gem5.stdout"
 LOG_PATH="$OUTDIR/board.pc.com_1.device"
-RESULT_LOG_PATH="$OUTDIR/hydrarpc_dedicated.result.log"
+RESULT_LOG_PATH="$OUTDIR/$RESULT_LOG_NAME"
 
 if [[ -z "$CHECKPOINT_ROOT" ]]; then
   CHECKPOINT_ROOT="$OUTDIR/checkpoints"
@@ -327,7 +380,17 @@ if [[ "$SKIP_IMAGE_SETUP" -eq 0 ]]; then
     bash tools/setup_hydrarpc_dedicated_disk_image.sh "$DISK_IMAGE"
 fi
 
-GUEST_CMD="/home/test_code/run_hydrarpc_dedicated.sh --client-count ${CLIENT_COUNT} --count-per-client ${COUNT_PER_CLIENT} --window-size ${WINDOW_SIZE} --slot-count ${SLOT_COUNT} --req-bytes ${REQ_BYTES} --resp-bytes ${RESP_BYTES} --slow-client-count ${SLOW_CLIENT_COUNT} --slow-count-per-client ${SLOW_COUNT_PER_CLIENT} --slow-send-gap-ns ${SLOW_SEND_GAP_NS} --send-mode ${SEND_MODE} --send-gap-ns ${SEND_GAP_NS} --request-transfer-mode ${REQUEST_TRANSFER_MODE} --response-transfer-mode ${RESPONSE_TRANSFER_MODE} --cxl-node ${CXL_NODE} --server-cpu ${SERVER_CPU}"
+if [[ -n "$GUEST_CMD_OVERRIDE" ]]; then
+  GUEST_CMD="$GUEST_CMD_OVERRIDE"
+else
+  GUEST_CMD="/home/test_code/run_hydrarpc_dedicated.sh --client-count ${CLIENT_COUNT} --count-per-client ${COUNT_PER_CLIENT} --window-size ${WINDOW_SIZE} --slot-count ${SLOT_COUNT} --req-bytes ${REQ_BYTES} --resp-bytes ${RESP_BYTES} --slow-client-count ${SLOW_CLIENT_COUNT} --slow-count-per-client ${SLOW_COUNT_PER_CLIENT} --slow-send-gap-ns ${SLOW_SEND_GAP_NS} --send-mode ${SEND_MODE} --send-gap-ns ${SEND_GAP_NS} --request-transfer-mode ${REQUEST_TRANSFER_MODE} --response-transfer-mode ${RESPONSE_TRANSFER_MODE} --cxl-node ${CXL_NODE} --server-cpu ${SERVER_CPU}"
+  if [[ -n "$REQ_MIN_BYTES" || -n "$REQ_MAX_BYTES" ]]; then
+    GUEST_CMD+=" --req-min-bytes ${REQ_MIN_BYTES:-$REQ_BYTES} --req-max-bytes ${REQ_MAX_BYTES:-$REQ_BYTES}"
+  fi
+  if [[ -n "$RESP_MIN_BYTES" || -n "$RESP_MAX_BYTES" ]]; then
+    GUEST_CMD+=" --resp-min-bytes ${RESP_MIN_BYTES:-$RESP_BYTES} --resp-max-bytes ${RESP_MAX_BYTES:-$RESP_BYTES}"
+  fi
+fi
 WORKLOAD_FILE="$OUTDIR/hydrarpc_dedicated.runscript"
 RESTORE_WORKLOAD_FILE="$OUTDIR/hydrarpc_dedicated.restore.runscript"
 
@@ -449,6 +512,7 @@ PY
     --kernel "$KERNEL"
     --disk-image "$DISK_IMAGE"
     --terminal-port "$boot_terminal_port"
+    --cxl-bridge-extra-latency "$CXL_BRIDGE_EXTRA_LATENCY"
   )
 
   if ! "$BINARY" "${boot_args[@]}" >"$boot_log" 2>&1; then
@@ -483,6 +547,7 @@ gem5_args+=(
   --kernel "$KERNEL"
   --disk-image "$DISK_IMAGE"
   --terminal-port "$TERMINAL_PORT"
+  --cxl-bridge-extra-latency "$CXL_BRIDGE_EXTRA_LATENCY"
 )
 
 if [[ "$ATOMIC_CHECKPOINT" -eq 1 ]]; then

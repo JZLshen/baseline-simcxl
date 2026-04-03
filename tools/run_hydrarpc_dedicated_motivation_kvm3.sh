@@ -21,6 +21,7 @@ Options:
   --guest-cflags <flags>   Host gcc flags for guest binaries.
   --skip-build             Skip scons build.
   --skip-image-setup       Reuse already injected guest binaries.
+  --continue-on-failure    Record failed sweeps and continue the shard.
   --skip-existing          Reuse existing sweep outdirs when possible.
   --dry-run                Print commands only.
   --help                   Show this message.
@@ -51,8 +52,10 @@ SLOT_COUNT=1024
 GUEST_CFLAGS=""
 SKIP_BUILD=0
 SKIP_IMAGE_SETUP=0
+CONTINUE_ON_FAILURE=0
 SKIP_EXISTING=0
 DRY_RUN=0
+ANY_FAILURES=0
 
 run_cmd() {
   printf '[%s] ' "$(date '+%F %T')" | tee -a "$RUN_LOG"
@@ -75,6 +78,12 @@ wait_for_background_or_fail() {
   set -e
 
   if [[ "$wait_rc" -ne 0 ]]; then
+    ANY_FAILURES=1
+    if [[ "$CONTINUE_ON_FAILURE" -eq 1 ]]; then
+      echo "[$(date '+%F %T')] CONTINUE-FAIL background job rc=${wait_rc}; continuing remaining motivation work" \
+        | tee -a "$RUN_LOG"
+      return 0
+    fi
     jobs -pr | xargs -r kill 2>/dev/null || true
     wait || true
     echo "[$(date '+%F %T')] FAIL-FAST aborting motivation shard after background failure" \
@@ -187,6 +196,9 @@ run_noncc_single() {
   args+=("$@")
   append_common_noncc_args args
   args+=(--parallel-jobs 1)
+  if [[ "$CONTINUE_ON_FAILURE" -eq 1 ]]; then
+    args+=(--continue-on-failure)
+  fi
   run_cmd "${args[@]}"
 }
 
@@ -203,6 +215,9 @@ run_cc_pow2() {
 
   append_common_cc_args args
   args+=(--parallel-jobs "$PARALLEL_JOBS")
+  if [[ "$CONTINUE_ON_FAILURE" -eq 1 ]]; then
+    args+=(--continue-on-failure)
+  fi
   run_cmd "${args[@]}"
 }
 
@@ -222,6 +237,9 @@ run_noncc_pow2() {
 
   append_common_noncc_args args
   args+=(--parallel-jobs "$PARALLEL_JOBS")
+  if [[ "$CONTINUE_ON_FAILURE" -eq 1 ]]; then
+    args+=(--continue-on-failure)
+  fi
   run_cmd "${args[@]}"
 }
 
@@ -378,6 +396,10 @@ while [[ $# -gt 0 ]]; do
       SKIP_IMAGE_SETUP=1
       shift 1
       ;;
+    --continue-on-failure)
+      CONTINUE_ON_FAILURE=1
+      shift 1
+      ;;
     --skip-existing)
       SKIP_EXISTING=1
       shift 1
@@ -421,7 +443,7 @@ mkdir -p "$ROOT_OUTDIR"
 ROOT_OUTDIR="$(cd "$ROOT_OUTDIR" && pwd)"
 CHECKPOINT_ROOT="$ROOT_OUTDIR/checkpoints"
 RUN_LOG="$ROOT_OUTDIR/run.log"
-: >"$RUN_LOG"
+touch "$RUN_LOG"
 
 ensure_build
 
@@ -438,7 +460,11 @@ case "$MACHINE_INDEX" in
 esac
 
 echo
-echo "Dedicated motivation shard complete."
+if [[ "$ANY_FAILURES" -ne 0 ]]; then
+  echo "Dedicated motivation shard complete with failures."
+else
+  echo "Dedicated motivation shard complete."
+fi
 echo "machine_index=$MACHINE_INDEX"
 echo "root_outdir=$ROOT_OUTDIR"
 echo "checkpoint_root=$CHECKPOINT_ROOT"

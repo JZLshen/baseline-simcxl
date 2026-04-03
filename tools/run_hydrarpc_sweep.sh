@@ -14,6 +14,10 @@ Options:
   --slot-count <N>         Ring depth passed to both shared and dedicated. Default: 1024
   --req-bytes <N>          Request payload bytes. Default: 64
   --resp-bytes <N>         Response payload bytes. Default: 64
+  --req-min-bytes <N>      Optional minimum request payload size for per-request uniform bins.
+  --req-max-bytes <N>      Optional maximum request payload size for per-request uniform bins.
+  --resp-min-bytes <N>     Optional minimum response payload size for per-request uniform bins.
+  --resp-max-bytes <N>     Optional maximum response payload size for per-request uniform bins.
   --cpu-type <type>        Switch CPU type passed to runners. Default: TIMING
   --boot-cpu <type>        Boot CPU type passed to runners. Default: KVM
   --slow-client-count <N>  Mark the first N client ids as slow. Default: 0
@@ -26,6 +30,8 @@ Options:
                            Dedicated request publish mode: staging or direct. Default: staging
   --response-transfer-mode <mode>
                            Dedicated response publish mode: staging or direct. Default: staging
+  --cxl-bridge-extra-latency <lat>
+                           Dedicated-only extra host-side CXL bridge latency. Default: 0ns
   --num-cpus <N>           Guest CPU count passed to runners. Default: auto
   --restore-checkpoint <dir>
                            Reuse an existing boot checkpoint for each run.
@@ -34,6 +40,7 @@ Options:
   --parallel-jobs <N>      Number of runs to execute concurrently. Default: 1
   --skip-build             Skip the top-level scons build.
   --parallel-pair          Run dedicated/shared of the same client_count in parallel.
+  --continue-on-failure    Record failed runs and continue the sweep.
   --skip-existing          Reuse existing outdirs and summary rows when possible.
   --help                   Show this message.
 EOF
@@ -46,6 +53,10 @@ KINDS="dedicated shared"
 SLOT_COUNT=1024
 REQ_BYTES=64
 RESP_BYTES=64
+REQ_MIN_BYTES=""
+REQ_MAX_BYTES=""
+RESP_MIN_BYTES=""
+RESP_MAX_BYTES=""
 CPU_TYPE="TIMING"
 BOOT_CPU="KVM"
 SLOW_CLIENT_COUNT=0
@@ -55,6 +66,7 @@ SEND_MODE="greedy"
 SEND_GAP_NS=0
 REQUEST_TRANSFER_MODE="staging"
 RESPONSE_TRANSFER_MODE="staging"
+CXL_BRIDGE_EXTRA_LATENCY="0ns"
 NUM_CPUS=0
 RESTORE_CHECKPOINT=""
 GUEST_CFLAGS=""
@@ -62,8 +74,10 @@ SKIP_IMAGE_SETUP=0
 PARALLEL_JOBS=1
 SKIP_BUILD=0
 PARALLEL_PAIR=0
+CONTINUE_ON_FAILURE=0
 SKIP_EXISTING=0
 DROP_FIRST_PER_CLIENT=5
+ANY_FAILURES=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -93,6 +107,22 @@ while [[ $# -gt 0 ]]; do
       ;;
     --resp-bytes)
       RESP_BYTES="$2"
+      shift 2
+      ;;
+    --req-min-bytes)
+      REQ_MIN_BYTES="$2"
+      shift 2
+      ;;
+    --req-max-bytes)
+      REQ_MAX_BYTES="$2"
+      shift 2
+      ;;
+    --resp-min-bytes)
+      RESP_MIN_BYTES="$2"
+      shift 2
+      ;;
+    --resp-max-bytes)
+      RESP_MAX_BYTES="$2"
       shift 2
       ;;
     --cpu-type)
@@ -131,6 +161,10 @@ while [[ $# -gt 0 ]]; do
       RESPONSE_TRANSFER_MODE="$2"
       shift 2
       ;;
+    --cxl-bridge-extra-latency)
+      CXL_BRIDGE_EXTRA_LATENCY="$2"
+      shift 2
+      ;;
     --num-cpus)
       NUM_CPUS="$2"
       shift 2
@@ -159,6 +193,10 @@ while [[ $# -gt 0 ]]; do
       PARALLEL_PAIR=1
       shift 1
       ;;
+    --continue-on-failure)
+      CONTINUE_ON_FAILURE=1
+      shift 1
+      ;;
     --skip-existing)
       SKIP_EXISTING=1
       shift 1
@@ -180,12 +218,41 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export DISK_IMAGE="${DISK_IMAGE:-${REPO_ROOT}/files/parsec.img}"
 cd "$REPO_ROOT"
 
+REQ_MIN_BYTES_EFFECTIVE="${REQ_MIN_BYTES:-$REQ_BYTES}"
+REQ_MAX_BYTES_EFFECTIVE="${REQ_MAX_BYTES:-$REQ_BYTES}"
+RESP_MIN_BYTES_EFFECTIVE="${RESP_MIN_BYTES:-$RESP_BYTES}"
+RESP_MAX_BYTES_EFFECTIVE="${RESP_MAX_BYTES:-$RESP_BYTES}"
+CXL_LAT_TAG="$(printf '%s' "$CXL_BRIDGE_EXTRA_LATENCY" | tr ' /' '__')"
+REQ_RANGE_ENABLED=0
+RESP_RANGE_ENABLED=0
+REQ_TAG="qb${REQ_BYTES}"
+RESP_TAG="pb${RESP_BYTES}"
+
+if [[ -n "$REQ_MIN_BYTES" || -n "$REQ_MAX_BYTES" ]]; then
+  REQ_RANGE_ENABLED=1
+fi
+if [[ -n "$RESP_MIN_BYTES" || -n "$RESP_MAX_BYTES" ]]; then
+  RESP_RANGE_ENABLED=1
+fi
+if [[ "$REQ_MIN_BYTES_EFFECTIVE" != "$REQ_MAX_BYTES_EFFECTIVE" ]]; then
+  REQ_TAG="qu${REQ_MIN_BYTES_EFFECTIVE}-${REQ_MAX_BYTES_EFFECTIVE}"
+fi
+if [[ "$RESP_MIN_BYTES_EFFECTIVE" != "$RESP_MAX_BYTES_EFFECTIVE" ]]; then
+  RESP_TAG="pu${RESP_MIN_BYTES_EFFECTIVE}-${RESP_MAX_BYTES_EFFECTIVE}"
+fi
+
 if [[ -z "$ROOT_OUTDIR" ]]; then
   ROOT_OUTDIR="output/hydrarpc_dedicated_shared_sweep_$(date +%Y%m%d_%H%M%S)"
 fi
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
   scons build/X86/gem5.opt -j"$(nproc)"
+else
+  bash tools/check_gem5_binary_freshness.sh \
+    --binary "build/X86/gem5.opt" \
+    --label "gem5 binary for dedicated/shared sweep" \
+    --monitor "configs/example/gem5_library/x86-cxl-type3-with-classic.py" \
+    --monitor "src/python/gem5/components/boards/x86_board.py"
 fi
 
 if [[ "$KINDS" == *"dedicated"* && "$SKIP_IMAGE_SETUP" -eq 0 ]]; then
@@ -212,8 +279,15 @@ STEADY_CSV="$ROOT_OUTDIR/steady_summary.csv"
 FAIL_CSV="$ROOT_OUTDIR/failures.csv"
 RUN_LOG="$ROOT_OUTDIR/run.log"
 RUN_FAILURES_TSV="$ROOT_OUTDIR/run_failures.tsv"
-rm -f "$SUMMARY_CSV" "$STEADY_CSV" "$FAIL_CSV" "$RUN_FAILURES_TSV"
-: >"$RUN_LOG"
+rm -f "$FAIL_CSV" "$RUN_FAILURES_TSV"
+touch "$RUN_LOG"
+
+has_success_result_json() {
+  local result_json="$1"
+
+  [[ -f "$result_json" ]] || return 1
+  rg -q '"status"[[:space:]]*:[[:space:]]*"success"' "$result_json" 2>/dev/null
+}
 
 record_failure() {
   local kind="$1"
@@ -265,19 +339,23 @@ run_outdir() {
   local kind="$1"
   local client_count="$2"
   local slow_suffix=""
+  local latency_suffix=""
 
   if [[ "$SLOW_CLIENT_COUNT" -gt 0 ]]; then
     slow_suffix="_slow${SLOW_CLIENT_COUNT}_n${SLOW_COUNT_PER_CLIENT}_sg${SLOW_SEND_GAP_NS}"
   fi
+  if [[ "$CXL_BRIDGE_EXTRA_LATENCY" != "0ns" ]]; then
+    latency_suffix="_cxl${CXL_LAT_TAG}"
+  fi
 
   if [[ "$kind" == "dedicated" ]]; then
     printf '%s\n' \
-      "$ROOT_OUTDIR/${kind}_s${SLOT_COUNT}_qb${REQ_BYTES}_pb${RESP_BYTES}_req${REQUEST_TRANSFER_MODE}_resp${RESPONSE_TRANSFER_MODE}_m${SEND_MODE}_g${SEND_GAP_NS}${slow_suffix}_c${client_count}_r${COUNT_PER_CLIENT}"
+      "$ROOT_OUTDIR/${kind}_s${SLOT_COUNT}_${REQ_TAG}_${RESP_TAG}_req${REQUEST_TRANSFER_MODE}_resp${RESPONSE_TRANSFER_MODE}_m${SEND_MODE}_g${SEND_GAP_NS}${latency_suffix}${slow_suffix}_c${client_count}_r${COUNT_PER_CLIENT}"
     return 0
   fi
 
   printf '%s\n' \
-    "$ROOT_OUTDIR/${kind}_s${SLOT_COUNT}_qb${REQ_BYTES}_pb${RESP_BYTES}_m${SEND_MODE}_g${SEND_GAP_NS}${slow_suffix}_c${client_count}_r${COUNT_PER_CLIENT}"
+    "$ROOT_OUTDIR/${kind}_s${SLOT_COUNT}_${REQ_TAG}_${RESP_TAG}_m${SEND_MODE}_g${SEND_GAP_NS}${latency_suffix}${slow_suffix}_c${client_count}_r${COUNT_PER_CLIENT}"
 }
 
 is_transient_cpu_failure() {
@@ -289,6 +367,20 @@ is_transient_cpu_failure() {
     "$outdir/hydrarpc_shared.result.log" \
     "$outdir/hydrarpc_dedicated.result.log" \
     2>/dev/null
+}
+
+archive_retry_outdir() {
+  local outdir="$1"
+  local attempt="$2"
+  local retry_outdir="${outdir}.retry${attempt}"
+  local suffix=1
+
+  while [[ -e "$retry_outdir" ]]; do
+    retry_outdir="${outdir}.retry${attempt}.rerun${suffix}"
+    suffix=$((suffix + 1))
+  done
+
+  mv "$outdir" "$retry_outdir"
 }
 
 run_runner_only() {
@@ -352,9 +444,16 @@ run_runner_only() {
         --send-gap-ns "$SEND_GAP_NS"
         --request-transfer-mode "$REQUEST_TRANSFER_MODE"
         --response-transfer-mode "$RESPONSE_TRANSFER_MODE"
+        --cxl-bridge-extra-latency "$CXL_BRIDGE_EXTRA_LATENCY"
       )
       if [[ -n "$GUEST_CFLAGS" ]]; then
         extra_args+=(--guest-cflags "$GUEST_CFLAGS")
+      fi
+      if [[ "$REQ_RANGE_ENABLED" -eq 1 ]]; then
+        extra_args+=(--req-min-bytes "$REQ_MIN_BYTES_EFFECTIVE" --req-max-bytes "$REQ_MAX_BYTES_EFFECTIVE")
+      fi
+      if [[ "$RESP_RANGE_ENABLED" -eq 1 ]]; then
+        extra_args+=(--resp-min-bytes "$RESP_MIN_BYTES_EFFECTIVE" --resp-max-bytes "$RESP_MAX_BYTES_EFFECTIVE")
       fi
     elif [[ "$kind" == "shared" ]]; then
       extra_args+=(
@@ -367,9 +466,16 @@ run_runner_only() {
         --slow-send-gap-ns "$SLOW_SEND_GAP_NS"
         --send-mode "$SEND_MODE"
         --send-gap-ns "$SEND_GAP_NS"
+        --cxl-bridge-extra-latency "$CXL_BRIDGE_EXTRA_LATENCY"
       )
       if [[ -n "$GUEST_CFLAGS" ]]; then
         extra_args+=(--guest-cflags "$GUEST_CFLAGS")
+      fi
+      if [[ "$REQ_RANGE_ENABLED" -eq 1 ]]; then
+        extra_args+=(--req-min-bytes "$REQ_MIN_BYTES_EFFECTIVE" --req-max-bytes "$REQ_MAX_BYTES_EFFECTIVE")
+      fi
+      if [[ "$RESP_RANGE_ENABLED" -eq 1 ]]; then
+        extra_args+=(--resp-min-bytes "$RESP_MIN_BYTES_EFFECTIVE" --resp-max-bytes "$RESP_MAX_BYTES_EFFECTIVE")
       fi
     fi
     set +e
@@ -392,7 +498,7 @@ run_runner_only() {
     if [[ "$attempt" -lt "$max_attempts" ]] && is_transient_cpu_failure "$outdir"; then
       echo "[$(date '+%F %T')] RETRY kind=${kind} client_count=${client_count} attempt=${attempt} reason=transient_guest_cpu_failure" \
         | tee -a "$RUN_LOG"
-      mv "$outdir" "${outdir}.retry${attempt}"
+      archive_retry_outdir "$outdir" "$attempt"
       attempt=$((attempt + 1))
       continue
     fi
@@ -422,9 +528,11 @@ process_one() {
   local summary_rc=0
   local runner_rc=0
   local runner_rc_file=""
+  local result_json_path=""
 
   outdir="$(run_outdir "$kind" "$client_count")"
   runner_rc_file="$outdir/runner.exitcode"
+  result_json_path="$outdir/result.json"
   case "$kind" in
     dedicated)
       experiment="dedicated"
@@ -442,18 +550,21 @@ process_one() {
     runner_rc="$(<"$runner_rc_file")"
   fi
 
-  if [[ "$runner_rc" -ne 0 ]]; then
-    echo "[$(date '+%F %T')] RUN-FAIL kind=${kind} client_count=${client_count} rc=${runner_rc} outdir=${outdir}" \
-      | tee -a "$RUN_LOG"
-    record_failure "$kind" "$client_count" "$runner_rc" "$outdir" "runner_failed"
-    return 1
-  fi
-
   if ! log_path="$(resolve_log_path "$kind" "$outdir")"; then
+    if [[ "$runner_rc" -ne 0 ]]; then
+      echo "[$(date '+%F %T')] RUN-FAIL kind=${kind} client_count=${client_count} rc=${runner_rc} outdir=${outdir}" \
+        | tee -a "$RUN_LOG"
+    fi
     echo "[$(date '+%F %T')] MISSING-LOG kind=${kind} client_count=${client_count} outdir=${outdir}" \
       | tee -a "$RUN_LOG"
     record_failure "$kind" "$client_count" "1" "$outdir" "missing_result_log"
     return 1
+  fi
+
+  if [[ "$SKIP_EXISTING" -eq 1 ]] && has_success_result_json "$result_json_path"; then
+    echo "[$(date '+%F %T')] REUSE-SUMMARY kind=${kind} client_count=${client_count} outdir=${outdir}" \
+      | tee -a "$RUN_LOG"
+    return 0
   fi
 
   expected_total_requests=$((client_count * COUNT_PER_CLIENT))
@@ -480,6 +591,10 @@ process_one() {
   set -e
 
   if [[ "$summary_rc" -ne 0 ]]; then
+    if [[ "$runner_rc" -ne 0 ]]; then
+      echo "[$(date '+%F %T')] RUN-FAIL kind=${kind} client_count=${client_count} rc=${runner_rc} outdir=${outdir}" \
+        | tee -a "$RUN_LOG"
+    fi
     echo "[$(date '+%F %T')] SUMMARY-FAIL kind=${kind} client_count=${client_count} rc=${summary_rc} outdir=${outdir}" \
       | tee -a "$RUN_LOG"
     printf '%s\n' "$summary_text" | tee -a "$RUN_LOG"
@@ -487,6 +602,10 @@ process_one() {
     return 1
   fi
 
+  if [[ "$runner_rc" -ne 0 ]]; then
+    echo "[$(date '+%F %T')] SALVAGED-SUCCESS kind=${kind} client_count=${client_count} runner_rc=${runner_rc} outdir=${outdir}" \
+      | tee -a "$RUN_LOG"
+  fi
   printf '%s\n' "$summary_text" | tee -a "$RUN_LOG"
   echo "[$(date '+%F %T')] END kind=${kind} client_count=${client_count} outdir=${outdir}" \
     | tee -a "$RUN_LOG"
@@ -503,6 +622,12 @@ wait_for_background_or_fail() {
   set -e
 
   if [[ "$wait_rc" -ne 0 ]]; then
+    ANY_FAILURES=1
+    if [[ "$CONTINUE_ON_FAILURE" -eq 1 ]]; then
+      echo "[$(date '+%F %T')] CONTINUE-FAIL background job rc=${wait_rc}; continuing remaining sweep work" \
+        | tee -a "$RUN_LOG"
+      return 0
+    fi
     jobs -pr | xargs -r kill 2>/dev/null || true
     wait || true
     echo "[$(date '+%F %T')] FAIL-FAST aborting sweep after background failure" \
@@ -536,25 +661,62 @@ else
         fi
       done
       if [[ -n "${pid_dedicated:-}" ]]; then
+        set +e
         wait "$pid_dedicated"
+        wait_rc=$?
+        set -e
+        if [[ "$wait_rc" -ne 0 ]]; then
+          ANY_FAILURES=1
+          if [[ "$CONTINUE_ON_FAILURE" -eq 0 ]]; then
+            exit "$wait_rc"
+          fi
+        fi
       fi
       if [[ -n "${pid_shared:-}" ]]; then
+        set +e
         wait "$pid_shared"
+        wait_rc=$?
+        set -e
+        if [[ "$wait_rc" -ne 0 ]]; then
+          ANY_FAILURES=1
+          if [[ "$CONTINUE_ON_FAILURE" -eq 0 ]]; then
+            exit "$wait_rc"
+          fi
+        fi
       fi
       for kind in $KINDS; do
-        process_one "$kind" "$client_count"
+        if ! process_one "$kind" "$client_count"; then
+          ANY_FAILURES=1
+          if [[ "$CONTINUE_ON_FAILURE" -eq 0 ]]; then
+            exit 1
+          fi
+        fi
       done
     else
       for kind in $KINDS; do
-        run_runner_only "$kind" "$client_count"
-        process_one "$kind" "$client_count"
+        if ! run_runner_only "$kind" "$client_count"; then
+          ANY_FAILURES=1
+          if [[ "$CONTINUE_ON_FAILURE" -eq 0 ]]; then
+            exit 1
+          fi
+        fi
+        if ! process_one "$kind" "$client_count"; then
+          ANY_FAILURES=1
+          if [[ "$CONTINUE_ON_FAILURE" -eq 0 ]]; then
+            exit 1
+          fi
+        fi
       done
     fi
   done
 fi
 
 echo
-echo "Sweep complete."
+if [[ "$ANY_FAILURES" -ne 0 ]]; then
+  echo "Sweep complete with failures."
+else
+  echo "Sweep complete."
+fi
 echo "root_outdir=$ROOT_OUTDIR"
 echo "summary_csv=$SUMMARY_CSV"
 echo "steady_csv=$STEADY_CSV"

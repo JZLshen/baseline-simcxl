@@ -82,9 +82,11 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
         cache_hierarchy: AbstractCacheHierarchy,
         cxl_memory: AbstractMemorySystem,
         is_asic: bool = True,
+        cxl_bridge_latency: str = "50ns",
     ) -> None:
         self._cxl_memory_ptr = cxl_memory
         self._is_asic = is_asic
+        self._cxl_bridge_latency = cxl_bridge_latency
 
         super().__init__(
             clk_freq=clk_freq,
@@ -158,7 +160,12 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
             APIC_range_size = 1 << 12
 
             # Configure CXLBridge
-            self.bridge = CXLBridge(bridge_lat="50ns", proto_proc_lat="12ns", req_fifo_depth=128, resp_fifo_depth=128)
+            self.bridge = CXLBridge(
+                bridge_lat=self._cxl_bridge_latency,
+                proto_proc_lat="12ns",
+                req_fifo_depth=128,
+                resp_fifo_depth=128,
+            )
             self.bridge.mem_side_port = self.get_io_bus().cpu_side_ports
             self.bridge.cpu_side_port = (
                 self.get_cache_hierarchy().get_mem_side_port()

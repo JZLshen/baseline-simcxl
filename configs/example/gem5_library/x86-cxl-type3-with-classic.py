@@ -45,6 +45,7 @@ scons build/X86/gem5.opt -j21
 import argparse
 from pathlib import Path
 import m5
+from m5.util.convert import anyToLatency
 from gem5.utils.requires import requires
 from gem5.components.boards.x86_board import X86Board
 from gem5.components.memory.single_channel import DIMM_DDR5_4400, SingleChannelDDR4_3200
@@ -98,6 +99,12 @@ parser.add_argument(
 )
 parser.add_argument('--cxl_mem_type', type=str, choices=['Simple', 'DRAM'], 
                     default='DRAM', help='CXL memory type')
+parser.add_argument(
+    '--cxl-bridge-extra-latency',
+    type=str,
+    default='0ns',
+    help='Extra latency added to the Classic-mode host CXL bridge. Default: 0ns',
+)
 parser.add_argument('--kernel', type=str,
                     default='',
                     help='Path to kernel image (vmlinux).')
@@ -179,6 +186,11 @@ if args.checkpoint_boot and not checkpoint_boot_script.exists():
 if readfile_path is not None and not readfile_path.exists():
     parser.error(f"readfile path not found: {readfile_path}")
 
+
+def add_latency(base_latency: str, extra_latency: str) -> str:
+    total_seconds = anyToLatency(base_latency) + anyToLatency(extra_latency)
+    return f"{total_seconds * 1e9:.12g}ns"
+
 # Setup Classic MESI Three Level Cache Hierarchy
 cache_hierarchy = PrivateL1PrivateL2SharedL3CacheHierarchy(
     l1d_size="48kB",
@@ -241,7 +253,8 @@ board = X86Board(
     memory=memory,
     cache_hierarchy=cache_hierarchy,
     cxl_memory=cxl_dram,
-    is_asic=(args.is_asic == 'True')
+    is_asic=(args.is_asic == 'True'),
+    cxl_bridge_latency=add_latency("50ns", args.cxl_bridge_extra_latency),
 )
 board.pc.com_1.device.port = args.terminal_port
 

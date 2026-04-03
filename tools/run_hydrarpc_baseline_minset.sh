@@ -10,7 +10,7 @@ Options:
   --root-outdir <dir>      Root output directory.
                            Default: output/paper_baseline_minset_<timestamp>
   --groups <list>          Quoted list from:
-                           "overall coherence req-size resp-size ring-size sparse32"
+                           "overall coherence req-size resp-size ring-size sparse32 cxl-latency"
                            Default: all groups
   --cpu-type <type>        Passed to sub-runners. Default: TIMING
   --boot-cpu <type>        Passed to sub-runners. Default: KVM
@@ -37,7 +37,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 ROOT_OUTDIR=""
-SELECTED_GROUPS="overall coherence req-size resp-size ring-size sparse32"
+SELECTED_GROUPS="overall coherence req-size resp-size ring-size sparse32 cxl-latency"
 CPU_TYPE="TIMING"
 BOOT_CPU="KVM"
 NUM_CPUS=0
@@ -107,6 +107,10 @@ run_overall_group() {
     --client-counts "1 2 4 8 16 32"
     --req-bytes 1530
     --resp-bytes 315
+    --req-min-bytes 765
+    --req-max-bytes 2295
+    --resp-min-bytes 158
+    --resp-max-bytes 472
   )
   append_common_sweep_args args
   run_cmd "${args[@]}"
@@ -117,6 +121,10 @@ run_overall_group() {
     --client-counts "1 2 4 8 16 32"
     --req-bytes 38
     --resp-bytes 230
+    --req-min-bytes 19
+    --req-max-bytes 57
+    --resp-min-bytes 115
+    --resp-max-bytes 345
   )
   append_common_sweep_args args
   run_cmd "${args[@]}"
@@ -187,7 +195,7 @@ run_ring_size_group() {
   local ring_size=""
   local args=()
 
-  for ring_size in 16 32 64 128 256 512; do
+  for ring_size in 16 32 64 128 256 512 1024; do
     args=(bash tools/run_hydrarpc_sweep.sh
       --root-outdir "$ROOT_OUTDIR/ringsize_dedicated_shared_c32_req64_resp64_s${ring_size}"
       --kinds "dedicated shared"
@@ -197,6 +205,24 @@ run_ring_size_group() {
       --resp-bytes 64
     )
     append_common_sweep_args args 0
+    run_cmd "${args[@]}"
+  done
+}
+
+run_cxl_latency_group() {
+  local latency=""
+  local args=()
+
+  for latency in 100ns 200ns 300ns; do
+    args=(bash tools/run_hydrarpc_sweep.sh
+      --root-outdir "$ROOT_OUTDIR/cxl_latency_dedicated_shared_c32_req64_resp64_${latency}"
+      --kinds "dedicated shared"
+      --client-counts "32"
+      --req-bytes 64
+      --resp-bytes 64
+      --cxl-bridge-extra-latency "$latency"
+    )
+    append_common_sweep_args args
     run_cmd "${args[@]}"
   done
 }
@@ -307,7 +333,8 @@ fi
 
 if [[ "$SKIP_IMAGE_SETUP" -eq 0 ]]; then
   if group_enabled overall || group_enabled req-size || group_enabled resp-size || \
-     group_enabled ring-size || group_enabled sparse32 || group_enabled coherence; then
+     group_enabled ring-size || group_enabled sparse32 || group_enabled coherence || \
+     group_enabled cxl-latency; then
     if [[ -n "$GUEST_CFLAGS" ]]; then
       run_cmd env HYDRARPC_GUEST_CFLAGS="$GUEST_CFLAGS" \
         bash tools/setup_hydrarpc_dedicated_disk_image.sh files/parsec.img
@@ -317,7 +344,7 @@ if [[ "$SKIP_IMAGE_SETUP" -eq 0 ]]; then
   fi
 
   if group_enabled overall || group_enabled req-size || group_enabled resp-size || \
-     group_enabled ring-size || group_enabled sparse32; then
+     group_enabled ring-size || group_enabled sparse32 || group_enabled cxl-latency; then
     if [[ -n "$GUEST_CFLAGS" ]]; then
       run_cmd env HYDRARPC_GUEST_CFLAGS="$GUEST_CFLAGS" \
         bash tools/setup_hydrarpc_shared_disk_image.sh files/parsec.img
@@ -358,6 +385,10 @@ esac
 
 case " $SELECTED_GROUPS " in
   *" sparse32 "*) run_sparse32_group ;;
+esac
+
+case " $SELECTED_GROUPS " in
+  *" cxl-latency "*) run_cxl_latency_group ;;
 esac
 
 echo

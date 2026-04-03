@@ -31,6 +31,39 @@ else
 	/sbin/m5 exit
 fi
 
+wait_for_guest_ready() {
+	ready_tries="${CHECKPOINT_READY_TRIES:-300}"
+	settle_secs="${CHECKPOINT_SETTLE_SECS:-5}"
+
+	echo "Waiting for Linux userspace readiness before checkpoint..."
+
+	while [ "$ready_tries" -gt 0 ]
+	do
+		state="$(systemctl is-system-running 2>/dev/null || true)"
+		if systemctl is-active --quiet multi-user.target
+		then
+			case "$state" in
+				running|degraded)
+					echo "Guest ready for checkpoint: state=${state}; settling ${settle_secs}s"
+					sleep "$settle_secs"
+					return 0
+					;;
+			esac
+		fi
+
+		ready_tries=$((ready_tries - 1))
+		sleep 1
+	done
+
+	echo "checkpoint_ready_timeout state=${state:-unknown}"
+	return 1
+}
+
+if ! wait_for_guest_ready
+then
+	/sbin/m5 exit
+fi
+
 # Checkpoint the first execution
 echo "Checkpointing simulation..."
 /sbin/m5 checkpoint

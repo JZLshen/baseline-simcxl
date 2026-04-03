@@ -26,6 +26,7 @@ Options:
   --skip-image-setup       Reuse already injected app guest binaries in the disk image.
   --parallel-jobs <N>      Number of runs to execute concurrently. Default: 1
   --skip-build             Skip the top-level scons build.
+  --continue-on-failure    Record failed runs and continue the sweep.
   --skip-existing          Reuse existing outdirs and summary rows when possible.
   --help                   Show this message.
 
@@ -54,9 +55,11 @@ GUEST_CFLAGS=""
 SKIP_IMAGE_SETUP=0
 PARALLEL_JOBS=1
 SKIP_BUILD=0
+CONTINUE_ON_FAILURE=0
 SKIP_EXISTING=0
 DROP_FIRST_PER_CLIENT=5
 CXL_NODE=1
+ANY_FAILURES=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -132,6 +135,10 @@ while [[ $# -gt 0 ]]; do
       SKIP_BUILD=1
       shift 1
       ;;
+    --continue-on-failure)
+      CONTINUE_ON_FAILURE=1
+      shift 1
+      ;;
     --skip-existing)
       SKIP_EXISTING=1
       shift 1
@@ -159,6 +166,12 @@ fi
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
   scons build/X86/gem5.opt -j"$(nproc)"
+else
+  bash tools/check_gem5_binary_freshness.sh \
+    --binary "build/X86/gem5.opt" \
+    --label "gem5 binary for app sweep" \
+    --monitor "configs/example/gem5_library/x86-cxl-type3-with-classic.py" \
+    --monitor "src/python/gem5/components/boards/x86_board.py"
 fi
 
 if [[ "$KINDS" == *"dedicated"* && "$SKIP_IMAGE_SETUP" -eq 0 ]]; then
@@ -185,8 +198,15 @@ STEADY_CSV="$ROOT_OUTDIR/steady_summary.csv"
 FAIL_CSV="$ROOT_OUTDIR/failures.csv"
 RUN_LOG="$ROOT_OUTDIR/run.log"
 RUN_FAILURES_TSV="$ROOT_OUTDIR/run_failures.tsv"
-rm -f "$SUMMARY_CSV" "$STEADY_CSV" "$FAIL_CSV" "$RUN_FAILURES_TSV"
-: >"$RUN_LOG"
+rm -f "$FAIL_CSV" "$RUN_FAILURES_TSV"
+touch "$RUN_LOG"
+
+has_success_result_json() {
+  local result_json="$1"
+
+  [[ -f "$result_json" ]] || return 1
+  rg -q '"status"[[:space:]]*:[[:space:]]*"success"' "$result_json" 2>/dev/null
+}
 
 record_failure() {
   local kind="$1"
@@ -370,26 +390,31 @@ process_one() {
   local summary_rc=0
   local runner_rc=0
   local runner_rc_file=""
+  local result_json_path=""
 
   outdir="$(run_outdir "$kind" "$profile" "$client_count")"
   runner_rc_file="$outdir/runner.exitcode"
+  result_json_path="$outdir/result.json"
 
   if [[ -f "$runner_rc_file" ]]; then
     runner_rc="$(<"$runner_rc_file")"
   fi
 
-  if [[ "$runner_rc" -ne 0 ]]; then
-    echo "[$(date '+%F %T')] RUN-FAIL kind=${kind} profile=${profile} client_count=${client_count} rc=${runner_rc} outdir=${outdir}" \
-      | tee -a "$RUN_LOG"
-    record_failure "$kind" "$profile" "$client_count" "$runner_rc" "$outdir" "runner_failed"
-    return 1
-  fi
-
   if ! log_path="$(resolve_log_path "$kind" "$outdir")"; then
+    if [[ "$runner_rc" -ne 0 ]]; then
+      echo "[$(date '+%F %T')] RUN-FAIL kind=${kind} profile=${profile} client_count=${client_count} rc=${runner_rc} outdir=${outdir}" \
+        | tee -a "$RUN_LOG"
+    fi
     echo "[$(date '+%F %T')] MISSING-LOG kind=${kind} profile=${profile} client_count=${client_count} outdir=${outdir}" \
       | tee -a "$RUN_LOG"
     record_failure "$kind" "$profile" "$client_count" "1" "$outdir" "missing_result_log"
     return 1
+  fi
+
+  if [[ "$SKIP_EXISTING" -eq 1 ]] && has_success_result_json "$result_json_path"; then
+    echo "[$(date '+%F %T')] REUSE-SUMMARY kind=${kind} profile=${profile} client_count=${client_count} outdir=${outdir}" \
+      | tee -a "$RUN_LOG"
+    return 0
   fi
 
   set +e
@@ -415,6 +440,10 @@ process_one() {
   set -e
 
   if [[ "$summary_rc" -ne 0 ]]; then
+    if [[ "$runner_rc" -ne 0 ]]; then
+      echo "[$(date '+%F %T')] RUN-FAIL kind=${kind} profile=${profile} client_count=${client_count} rc=${runner_rc} outdir=${outdir}" \
+        | tee -a "$RUN_LOG"
+    fi
     echo "[$(date '+%F %T')] SUMMARY-FAIL kind=${kind} profile=${profile} client_count=${client_count} rc=${summary_rc} outdir=${outdir}" \
       | tee -a "$RUN_LOG"
     printf '%s\n' "$summary_text" | tee -a "$RUN_LOG"
@@ -422,6 +451,10 @@ process_one() {
     return 1
   fi
 
+  if [[ "$runner_rc" -ne 0 ]]; then
+    echo "[$(date '+%F %T')] SALVAGED-SUCCESS kind=${kind} profile=${profile} client_count=${client_count} runner_rc=${runner_rc} outdir=${outdir}" \
+      | tee -a "$RUN_LOG"
+  fi
   printf '%s\n' "$summary_text" | tee -a "$RUN_LOG"
   echo "[$(date '+%F %T')] END kind=${kind} profile=${profile} client_count=${client_count} outdir=${outdir}" \
     | tee -a "$RUN_LOG"
@@ -446,6 +479,12 @@ wait_for_background_or_fail() {
   set -e
 
   if [[ "$wait_rc" -ne 0 ]]; then
+    ANY_FAILURES=1
+    if [[ "$CONTINUE_ON_FAILURE" -eq 1 ]]; then
+      echo "[$(date '+%F %T')] CONTINUE-FAIL background job rc=${wait_rc}; continuing remaining app sweep work" \
+        | tee -a "$RUN_LOG"
+      return 0
+    fi
     jobs -pr | xargs -r kill 2>/dev/null || true
     wait || true
     echo "[$(date '+%F %T')] FAIL-FAST aborting app sweep after background failure" \
@@ -463,7 +502,12 @@ for profile in $PROFILES; do
           wait_for_background_or_fail
         done
       else
-        run_and_process_one "$kind" "$profile" "$client_count"
+        if ! run_and_process_one "$kind" "$profile" "$client_count"; then
+          ANY_FAILURES=1
+          if [[ "$CONTINUE_ON_FAILURE" -eq 0 ]]; then
+            exit 1
+          fi
+        fi
       fi
     done
   done
@@ -476,7 +520,11 @@ if [[ "$PARALLEL_JOBS" -gt 1 ]]; then
 fi
 
 echo
-echo "Application sweep complete."
+if [[ "$ANY_FAILURES" -ne 0 ]]; then
+  echo "Application sweep complete with failures."
+else
+  echo "Application sweep complete."
+fi
 echo "root_outdir=$ROOT_OUTDIR"
 echo "summary_csv=$SUMMARY_CSV"
 echo "steady_csv=$STEADY_CSV"

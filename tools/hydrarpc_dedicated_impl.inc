@@ -1195,7 +1195,6 @@ run_server_dedicated(struct Connection *connections,
                                                                  slow_request_count);
             uint64_t slot = 0;
             uint64_t request_notify = 0;
-            uint64_t response_notify = 0;
             uint64_t request_len = 0;
             uint64_t request_offset = 0;
             uint64_t response_offset = 0;
@@ -1244,10 +1243,6 @@ run_server_dedicated(struct Connection *connections,
                 notify_queue_line_at(connection->response_queue, slot);
             request_notify = load_notify_word_remote(request_queue_line);
             if (!notify_valid(request_notify))
-                continue;
-
-            response_notify = load_notify_word_remote(response_queue_line);
-            if (notify_valid(response_notify))
                 continue;
 
             request_len = notify_len(request_notify);
@@ -1421,69 +1416,67 @@ run_client_dedicated(struct Connection *connection,
                             client_id,
                             sent,
                             send_schedule_base_ns)) {
-                if (!notify_valid(load_notify_word_remote(request_queue_line))) {
-                    uint64_t start = 0;
-                    uint64_t request_offset = request_data_tail;
-                    uint64_t request_payload_len =
+                uint64_t start = 0;
+                uint64_t request_offset = request_data_tail;
+                uint64_t request_payload_len =
 #if HYDRARPC_APP_VARIANT
-                        request_len_for_seq(request_length_plan,
-                                            app_runtime,
-                                            client_id,
-                                            sent,
-                                            client_request_count);
+                    request_len_for_seq(request_length_plan,
+                                        app_runtime,
+                                        client_id,
+                                        sent,
+                                        client_request_count);
 #else
-                        request_len_for_seq(request_length_plan,
-                                            client_id,
-                                            sent,
-                                            client_request_count);
+                    request_len_for_seq(request_length_plan,
+                                        client_id,
+                                        sent,
+                                        client_request_count);
 #endif
-                    size_t index = base + sent;
-                    uint8_t *request_shadow =
-                        request_shadow_at(request_shadow_local,
-                                          sent,
-                                          request_payload_stride);
+                size_t index = base + sent;
+                uint8_t *request_shadow =
+                    request_shadow_at(request_shadow_local,
+                                      sent,
+                                      request_payload_stride);
 
-                    start = m5_rpns_ns();
+                start = m5_rpns_ns();
 
-                    store_shared_u64(&timing->client_req_start_ts_ns[index], start);
-                    if (
+                store_shared_u64(&timing->client_req_start_ts_ns[index], start);
+                if (
 #if HYDRARPC_APP_VARIANT
-                        build_client_request_payload(
-                            app_runtime,
-                            client_id,
-                            sent,
-                            payload_at_offset(connection->request_data_area,
-                                              request_offset),
-                            request_shadow,
-                            request_payload_len,
-                            &rng_state,
-                            request_transfer_mode
-                        ) != 0
+                    build_client_request_payload(
+                        app_runtime,
+                        client_id,
+                        sent,
+                        payload_at_offset(connection->request_data_area,
+                                          request_offset),
+                        request_shadow,
+                        request_payload_len,
+                        &rng_state,
+                        request_transfer_mode
+                    ) != 0
 #else
-                        build_client_request_payload(
-                            payload_at_offset(connection->request_data_area,
-                                              request_offset),
-                            request_shadow,
-                            request_payload_len,
-                            &rng_state,
-                            request_transfer_mode
-                        ) != 0
+                    build_client_request_payload(
+                        payload_at_offset(connection->request_data_area,
+                                          request_offset),
+                        request_shadow,
+                        request_payload_len,
+                        &rng_state,
+                        request_transfer_mode
+                    ) != 0
 #endif
-                    ) {
-                        fprintf(stderr,
-                                "client %" PRIu64 " failed to build request payload\n",
-                                client_id);
+                ) {
+                    fprintf(stderr,
+                            "client %" PRIu64 " failed to build request payload\n",
+                            client_id);
                         set_control_error(control);
                         break;
-                    }
-                    write_notify_word_remote(request_queue_line,
-                                             notify_make(request_offset,
-                                                         request_payload_len));
-
-                    request_data_tail += payload_span_u64(request_payload_len);
-                    sent++;
-                    made_progress = 1;
                 }
+                write_notify_word_remote(request_queue_line,
+                                         notify_make(request_offset,
+                                                     request_payload_len));
+
+                request_data_tail += payload_span_u64(request_payload_len);
+                sent++;
+                made_progress = 1;
             }
         }
 
@@ -2150,6 +2143,16 @@ main(int argc, char **argv)
 
     if (slot_count == 0) {
         fprintf(stderr, "slot-count must be positive after defaulting\n");
+        rc = 2;
+        goto cleanup;
+    }
+    if (slot_count < min_u64(window_size, request_count)) {
+        fprintf(stderr,
+                "current dedicated baseline requires slot-count (%" PRIu64
+                ") >= min(window-size, count-per-client) (%" PRIu64
+                ") because slot vacancy checks are disabled\n",
+                slot_count,
+                min_u64(window_size, request_count));
         rc = 2;
         goto cleanup;
     }
