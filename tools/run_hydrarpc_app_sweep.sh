@@ -481,8 +481,9 @@ wait_for_background_or_fail() {
   if [[ "$wait_rc" -ne 0 ]]; then
     ANY_FAILURES=1
     if [[ "$CONTINUE_ON_FAILURE" -eq 1 ]]; then
-      echo "[$(date '+%F %T')] CONTINUE-FAIL background job rc=${wait_rc}; continuing remaining app sweep work" \
-        | tee -a "$RUN_LOG"
+      local continue_msg="[$(date '+%F %T')] CONTINUE-FAIL background job rc=${wait_rc}; continuing remaining app sweep work"
+      printf '%s\n' "$continue_msg"
+      printf '%s\n' "$continue_msg" >>"$RUN_LOG"
       return 0
     fi
     jobs -pr | xargs -r kill 2>/dev/null || true

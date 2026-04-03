@@ -135,6 +135,12 @@ parser.add_argument(
     help='Boot with the fast boot CPU, execute a checkpoint-prep runscript, and exit after checkpoint generation.',
 )
 parser.add_argument(
+    '--checkpoint-boot-script',
+    type=str,
+    default='',
+    help='Optional host script used instead of configs/boot/hack_back_ckpt.rcS when --checkpoint-boot is set.',
+)
+parser.add_argument(
     '--restore-checkpoint',
     type=str,
     default='',
@@ -167,7 +173,11 @@ if args.disable_workload and (
 kernel_path = Path(args.kernel) if args.kernel else DEFAULT_KERNEL
 disk_image_path = Path(args.disk_image) if args.disk_image else DEFAULT_DISK_IMAGE
 restore_checkpoint = Path(args.restore_checkpoint) if args.restore_checkpoint else None
-checkpoint_boot_script = REPO_ROOT / "configs" / "boot" / "hack_back_ckpt.rcS"
+checkpoint_boot_script = (
+    Path(args.checkpoint_boot_script)
+    if args.checkpoint_boot_script
+    else REPO_ROOT / "configs" / "boot" / "hack_back_ckpt.rcS"
+)
 readfile_path = Path(args.readfile_path) if args.readfile_path else None
 
 if not kernel_path.exists():

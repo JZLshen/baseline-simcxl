@@ -144,10 +144,10 @@ sudo mkdir -p "${MOUNT_POINT}${GUEST_DEST_DIR}"
 sudo install -m 0755 "${HOST_BINARY}" "${MOUNT_POINT}${GUEST_BINARY}"
 
 WRAPPER_TMP="$(mktemp)"
-cat > "${WRAPPER_TMP}" <<'EOF'
+cat > "${WRAPPER_TMP}" <<EOF
 #!/bin/sh
 set -eu
-exec numactl -N 0 -m 0 /home/test_code/hydrarpc_dedicated "$@"
+exec numactl -N 0 -m 0 ${GUEST_BINARY} "\$@"
 EOF
 sudo install -m 0755 "${WRAPPER_TMP}" "${MOUNT_POINT}${GUEST_WRAPPER}"
 rm -f "${WRAPPER_TMP}"

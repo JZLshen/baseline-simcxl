@@ -39,6 +39,7 @@ EOF
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export DISK_IMAGE="${DISK_IMAGE:-${REPO_ROOT}/files/parsec.img}"
+CC_CHECKPOINT_BOOT_SCRIPT="${REPO_ROOT}/configs/boot/hack_back_ckpt_exec_guest_autorun.rcS"
 
 MACHINE_INDEX=""
 ROOT_OUTDIR=""
@@ -130,6 +131,7 @@ ensure_coherent_image() {
 
 ensure_checkpoint() {
   local mode="$1"
+  local checkpoint_boot_script="${2:-}"
   local outdir="$CHECKPOINT_ROOT/${mode}_n${NUM_CPUS}"
   local cmd=(bash tools/create_hydrarpc_boot_checkpoint.sh
     --mode "$mode"
@@ -140,6 +142,10 @@ ensure_checkpoint() {
     --disk-image "$DISK_IMAGE"
     --skip-build
   )
+
+  if [[ -n "$checkpoint_boot_script" ]]; then
+    cmd+=(--checkpoint-boot-script "$checkpoint_boot_script")
+  fi
 
   run_cmd "${cmd[@]}"
 }
@@ -176,6 +182,7 @@ append_common_cc_args() {
     --boot-cpu "$BOOT_CPU"
     --num-cpus "$NUM_CPUS"
     --restore-checkpoint "$(checkpoint_path ruby)"
+    --restore-dispatch guest-file
     --skip-build
     --skip-image-setup
   )
@@ -193,8 +200,8 @@ run_noncc_single() {
   shift
   local args=(bash tools/run_hydrarpc_sweep.sh --root-outdir "$root_outdir")
 
-  args+=("$@")
   append_common_noncc_args args
+  args+=("$@")
   args+=(--parallel-jobs 1)
   if [[ "$CONTINUE_ON_FAILURE" -eq 1 ]]; then
     args+=(--continue-on-failure)
@@ -292,9 +299,8 @@ run_respsize_batch() {
 
 run_machine1() {
   ensure_dedicated_image
-  ensure_coherent_image
   ensure_checkpoint classic
-  ensure_checkpoint ruby
+  ensure_checkpoint ruby "$CC_CHECKPOINT_BOOT_SCRIPT"
 
   run_cc_pow2 "$ROOT_OUTDIR/cc_direct_req64_resp64_pow2"
   run_respsize_batch

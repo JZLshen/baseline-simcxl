@@ -19,6 +19,7 @@
 #include <linux/mempolicy.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -118,6 +119,43 @@ m5_rpns_ns(void)
     return m5_rpns();
 }
 
+static int
+trace_enabled(void)
+{
+    static int initialized = 0;
+    static int enabled = 0;
+    const char *value = NULL;
+
+    if (!initialized) {
+        value = getenv("HYDRARPC_TRACE");
+        enabled = (value != NULL &&
+                   value[0] != '\0' &&
+                   strcmp(value, "0") != 0) ? 1 : 0;
+        initialized = 1;
+    }
+
+    return enabled;
+}
+
+static void
+tracef(const char *fmt, ...)
+{
+    va_list ap;
+
+    if (!trace_enabled())
+        return;
+
+    fprintf(stderr,
+            "hydrarpc_trace[%s][pid=%ld]: ",
+            HYDRARPC_VARIANT_NAME,
+            (long)getpid());
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+    fflush(stderr);
+}
+
 #if !HYDRARPC_COHERENT
 static inline void
 clflushopt_line(const void *ptr)
@@ -192,6 +230,19 @@ send_mode_string(enum SendMode mode)
         return "staggered";
       case SEND_UNEVEN:
         return "uneven";
+      default:
+        return "unknown";
+    }
+}
+
+static const char *
+transfer_mode_string(enum TransferMode mode)
+{
+    switch (mode) {
+      case TRANSFER_STAGING:
+        return "staging";
+      case TRANSFER_DIRECT:
+        return "direct";
       default:
         return "unknown";
     }
@@ -843,8 +894,14 @@ payload_length_plan_len(const struct PayloadLengthPlan *plan,
 static void
 signal_ready_and_wait(struct SharedControl *control)
 {
+    tracef("ready_wait_enter ready_count=%" PRIu64,
+           __atomic_load_n((const uint64_t *)&control->ready_count,
+                           __ATOMIC_ACQUIRE));
     __atomic_fetch_add(&control->ready_count, 1, __ATOMIC_RELEASE);
     wait_for_start(&control->start_flag);
+    tracef("ready_wait_exit start_flag=%" PRIu64,
+           __atomic_load_n((const uint64_t *)&control->start_flag,
+                           __ATOMIC_ACQUIRE));
 }
 
 static inline uint8_t *
@@ -1149,9 +1206,18 @@ run_server_dedicated(struct Connection *connections,
     uint64_t next_client_hint = 0;
     uint8_t *request_payload_local = malloc((size_t)request_payload_stride);
     uint8_t *response_staging = NULL;
+    int first_request_logged = 0;
 
     if (response_transfer_mode == TRANSFER_STAGING)
         response_staging = malloc((size_t)response_payload_stride);
+
+    tracef("server_enter client_count=%" PRIu64 " request_count=%" PRIu64
+           " slot_count=%" PRIu64 " server_cpu=%d resp_mode=%s",
+           client_count,
+           request_count,
+           slot_count,
+           server_cpu,
+           transfer_mode_string(response_transfer_mode));
 
     if (next_seq == NULL || response_data_tail == NULL ||
         request_payload_local == NULL ||
@@ -1177,6 +1243,7 @@ run_server_dedicated(struct Connection *connections,
 
     signal_ready_and_wait(control);
     store_shared_u64(timing->server_loop_start_ts_ns, m5_rpns_ns());
+    tracef("server_loop_start ts=%" PRIu64, *timing->server_loop_start_ts_ns);
 
     while (completed_total < total_request_target &&
            !control_has_error(control)) {
@@ -1245,6 +1312,15 @@ run_server_dedicated(struct Connection *connections,
             if (!notify_valid(request_notify))
                 continue;
 
+            if (!first_request_logged) {
+                tracef("server_first_request client=%" PRIu64 " seq=%" PRIu64
+                       " slot=%" PRIu64 " notify=0x%016" PRIx64,
+                       client_id,
+                       seq,
+                       slot,
+                       request_notify);
+            }
+
             request_len = notify_len(request_notify);
             if (request_len != expected_request_len) {
                 fprintf(stderr, "server observed unexpected request length\n");
@@ -1296,6 +1372,15 @@ run_server_dedicated(struct Connection *connections,
             write_notify_word_remote(response_queue_line,
                                      notify_make(response_offset,
                                                  expected_response_len));
+            if (!first_request_logged) {
+                tracef("server_first_response client=%" PRIu64 " seq=%" PRIu64
+                       " response_len=%" PRIu64 " response_offset=%" PRIu64,
+                       client_id,
+                       seq,
+                       expected_response_len,
+                       response_offset);
+                first_request_logged = 1;
+            }
             server_resp_done_ts = m5_rpns_ns();
             store_shared_u64(&timing->server_req_observe_ts_ns[index],
                              server_req_observe_ts);
@@ -1321,6 +1406,9 @@ run_server_dedicated(struct Connection *connections,
     free(response_data_tail);
     free(request_payload_local);
     free(response_staging);
+    tracef("server_exit completed_total=%" PRIu64 " rc=%d",
+           completed_total,
+           control_has_error(control) ? 1 : 0);
     return control_has_error(control) ? 1 : 0;
 }
 
@@ -1366,6 +1454,17 @@ run_client_dedicated(struct Connection *connection,
     uint8_t *request_shadow_local = calloc((size_t)client_request_count,
                                            (size_t)request_payload_stride);
     uint8_t *response_local = malloc((size_t)response_payload_stride);
+    int first_request_logged = 0;
+    int first_response_logged = 0;
+
+    tracef("client_enter client=%" PRIu64 " client_count=%" PRIu64
+           " request_count=%" PRIu64 " slot_count=%" PRIu64
+           " req_mode=%s",
+           client_id,
+           client_count,
+           client_request_count,
+           slot_count,
+           transfer_mode_string(request_transfer_mode));
 
     if (request_shadow_local == NULL || response_local == NULL) {
         fprintf(stderr, "client %" PRIu64 " local tracking allocation failed\n",
@@ -1393,6 +1492,9 @@ run_client_dedicated(struct Connection *connection,
 
     signal_ready_and_wait(control);
     send_schedule_base_ns = m5_rpns_ns();
+    tracef("client_start client=%" PRIu64 " schedule_base_ns=%" PRIu64,
+           client_id,
+           send_schedule_base_ns);
 
     while (completed < client_request_count && !control_has_error(control)) {
         int made_progress = 0;
@@ -1438,6 +1540,16 @@ run_client_dedicated(struct Connection *connection,
                                       request_payload_stride);
 
                 start = m5_rpns_ns();
+                if (!first_request_logged) {
+                    tracef("client_first_request_build client=%" PRIu64
+                           " seq=%" PRIu64 " slot=%" PRIu64
+                           " request_len=%" PRIu64 " request_offset=%" PRIu64,
+                           client_id,
+                           sent,
+                           slot,
+                           request_payload_len,
+                           request_offset);
+                }
 
                 store_shared_u64(&timing->client_req_start_ts_ns[index], start);
                 if (
@@ -1473,6 +1585,13 @@ run_client_dedicated(struct Connection *connection,
                 write_notify_word_remote(request_queue_line,
                                          notify_make(request_offset,
                                                      request_payload_len));
+                if (!first_request_logged) {
+                    tracef("client_first_request_sent client=%" PRIu64
+                           " seq=%" PRIu64,
+                           client_id,
+                           sent);
+                    first_request_logged = 1;
+                }
 
                 request_data_tail += payload_span_u64(request_payload_len);
                 sent++;
@@ -1487,6 +1606,15 @@ run_client_dedicated(struct Connection *connection,
                 uint64_t response_notify = load_notify_word_remote(response_queue_line);
 
                 if (notify_valid(response_notify)) {
+                    if (!first_response_logged) {
+                        tracef("client_first_response_notify client=%" PRIu64
+                               " seq=%" PRIu64 " slot=%" PRIu64
+                               " notify=0x%016" PRIx64,
+                               client_id,
+                               completed,
+                               slot,
+                               response_notify);
+                    }
                     uint64_t response_len = notify_len(response_notify);
                     uint64_t response_offset = notify_offset(response_notify);
                     uint64_t expected_request_len =
@@ -1564,6 +1692,14 @@ run_client_dedicated(struct Connection *connection,
                 store_shared_u64(&timing->client_resp_done_ts_ns[base + completed],
                                  end);
                 clear_notify_word_remote(response_queue_line);
+                if (!first_response_logged) {
+                    tracef("client_first_response_done client=%" PRIu64
+                           " seq=%" PRIu64 " response_len=%" PRIu64,
+                           client_id,
+                           completed,
+                           response_len);
+                    first_response_logged = 1;
+                }
 
                 completed++;
                 made_progress = 1;
@@ -1576,6 +1712,12 @@ run_client_dedicated(struct Connection *connection,
 
     free(request_shadow_local);
     free(response_local);
+    tracef("client_exit client=%" PRIu64 " sent=%" PRIu64
+           " completed=%" PRIu64 " rc=%d",
+           client_id,
+           sent,
+           completed,
+           control_has_error(control) ? 1 : 0);
     return control_has_error(control) ? 1 : 0;
 }
 
@@ -1793,6 +1935,8 @@ main(int argc, char **argv)
     pid_t *child_pids = NULL;
     uint64_t created_children = 0;
     int rc = 0;
+
+    tracef("main_enter argc=%d", argc);
 
 #if HYDRARPC_APP_VARIANT
     if (hydrarpc_app_lookup_profile(HYDRARPC_APP_PROFILE_YCSB_C_1K,
@@ -2218,6 +2362,24 @@ main(int argc, char **argv)
         sizeof(*timing.server_loop_start_ts_ns)
     );
 
+    tracef("config client_count=%" PRIu64 " request_count=%" PRIu64
+           " window_size=%" PRIu64 " slot_count=%" PRIu64
+           " req_range=%" PRIu64 "..%" PRIu64
+           " resp_range=%" PRIu64 "..%" PRIu64
+           " server_cpu=%d cxl_node=%d req_mode=%s resp_mode=%s",
+           client_count,
+           request_count,
+           window_size,
+           slot_count,
+           request_length_plan.min_size,
+           request_length_plan.max_size,
+           response_length_plan.min_size,
+           response_length_plan.max_size,
+           server_cpu,
+           cxl_node,
+           transfer_mode_string(request_transfer_mode),
+           transfer_mode_string(response_transfer_mode));
+
     if (connections == NULL || child_pids == NULL) {
         fprintf(stderr, "allocation failed for connections/child pids\n");
         rc = 1;
@@ -2236,6 +2398,12 @@ main(int argc, char **argv)
         init_notify_ring(connections[client_id].request_queue, slot_count);
         init_notify_ring(connections[client_id].response_queue, slot_count);
     }
+    tracef("allocation_complete request_queue_size=%zu response_queue_size=%zu"
+           " request_data_size=%zu response_data_size=%zu",
+           request_queue_size,
+           response_queue_size,
+           request_data_size,
+           response_data_size);
 
     {
         pid_t pid = fork();
@@ -2265,6 +2433,7 @@ main(int argc, char **argv)
             _exit(child_rc == 0 ? 0 : 1);
         }
         child_pids[created_children++] = pid;
+        tracef("forked_server pid=%ld", (long)pid);
     }
 
     for (uint64_t client_id = 0; client_id < client_count; client_id++) {
@@ -2301,12 +2470,20 @@ main(int argc, char **argv)
             _exit(child_rc == 0 ? 0 : 1);
         }
         child_pids[created_children++] = pid;
+        tracef("forked_client client=%" PRIu64 " pid=%ld",
+               client_id,
+               (long)pid);
     }
 
     while (!control_has_error(control) &&
            __atomic_load_n((const uint64_t *)&control->ready_count,
                            __ATOMIC_ACQUIRE) < client_count + 1) {
     }
+
+    tracef("all_children_ready ready_count=%" PRIu64 " expected=%" PRIu64,
+           __atomic_load_n((const uint64_t *)&control->ready_count,
+                           __ATOMIC_ACQUIRE),
+           client_count + 1);
 
     if (control_has_error(control)) {
         rc = 1;
@@ -2315,6 +2492,7 @@ main(int argc, char **argv)
     }
 
     __atomic_store_n((uint64_t *)&control->start_flag, 1, __ATOMIC_RELEASE);
+    tracef("start_flag_released");
 
 wait_children:
     for (uint64_t remaining = created_children; remaining > 0; remaining--) {
@@ -2329,6 +2507,7 @@ wait_children:
         }
 
         mark_child_reaped(child_pids, created_children, pid);
+        tracef("child_reaped pid=%ld status=%d", (long)pid, status);
         if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
             if (WIFSIGNALED(status)) {
                 fprintf(stderr, "child %ld killed by signal %d\n",
@@ -2355,6 +2534,8 @@ wait_children:
                               &timing) != 0) {
         fprintf(stderr, "failed to write %s\n", result_log_name);
         rc = 1;
+    } else {
+        tracef("result_log_written name=%s rc=%d", result_log_name, rc);
     }
 
 cleanup:

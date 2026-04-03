@@ -126,8 +126,8 @@ run_noncc_sweep() {
   local name="$1"
   shift
   local args=(bash tools/run_hydrarpc_sweep.sh --root-outdir "$ROOT_OUTDIR/$name")
-  args+=("$@")
   append_common_sweep_args args
+  args+=("$@")
   run_cmd "${args[@]}"
 }
 
@@ -135,8 +135,8 @@ run_cc_sweep() {
   local name="$1"
   shift
   local args=(bash tools/run_hydrarpc_coherent_sweep.sh --root-outdir "$ROOT_OUTDIR/$name")
-  args+=("$@")
   append_common_sweep_args args
+  args+=("$@")
   run_cmd "${args[@]}"
 }
 

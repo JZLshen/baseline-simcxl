@@ -28,6 +28,12 @@ Options:
   --num-cpus <N>           Guest CPU count passed to the runner. Default: auto
   --restore-checkpoint <dir>
                            Reuse an existing boot checkpoint for each run.
+  --restore-dispatch <mode>
+                           Restored workload dispatch: readfile or guest-file.
+                           Default: readfile
+  --guest-file-disk-image <path>
+                           Reusable private disk image for guest-file restore.
+                           Default: <root-outdir>/guest_file_parsec.img
   --guest-cflags <flags>   Host gcc flags used for the injected guest binary.
   --skip-image-setup       Reuse the coherent dedicated guest binary already injected into the disk image.
   --parallel-jobs <N>      Number of runs to execute concurrently. Default: 1
@@ -55,6 +61,8 @@ REQUEST_TRANSFER_MODE="staging"
 RESPONSE_TRANSFER_MODE="staging"
 NUM_CPUS=0
 RESTORE_CHECKPOINT=""
+RESTORE_DISPATCH="readfile"
+GUEST_FILE_DISK_IMAGE=""
 GUEST_CFLAGS=""
 SKIP_IMAGE_SETUP=0
 PARALLEL_JOBS=1
@@ -134,6 +142,14 @@ while [[ $# -gt 0 ]]; do
       RESTORE_CHECKPOINT="$2"
       shift 2
       ;;
+    --restore-dispatch)
+      RESTORE_DISPATCH="$2"
+      shift 2
+      ;;
+    --guest-file-disk-image)
+      GUEST_FILE_DISK_IMAGE="$2"
+      shift 2
+      ;;
     --guest-cflags)
       GUEST_CFLAGS="$2"
       shift 2
@@ -175,8 +191,27 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export DISK_IMAGE="${DISK_IMAGE:-${REPO_ROOT}/files/parsec.img}"
 cd "$REPO_ROOT"
 
+case "$RESTORE_DISPATCH" in
+  readfile|guest-file)
+    ;;
+  *)
+    echo "unsupported --restore-dispatch: $RESTORE_DISPATCH" >&2
+    exit 1
+    ;;
+esac
+
 if [[ -z "$ROOT_OUTDIR" ]]; then
   ROOT_OUTDIR="output/hydrarpc_dedicated_coherent_sweep_$(date +%Y%m%d_%H%M%S)"
+fi
+
+if [[ "$RESTORE_DISPATCH" == "guest-file" ]]; then
+  if [[ -z "$GUEST_FILE_DISK_IMAGE" ]]; then
+    GUEST_FILE_DISK_IMAGE="$ROOT_OUTDIR/guest_file_parsec.img"
+  fi
+  if [[ "$PARALLEL_JOBS" -gt 1 ]]; then
+    echo "guest-file restore reuses one private parsec image; forcing --parallel-jobs=1" >&2
+    PARALLEL_JOBS=1
+  fi
 fi
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
@@ -355,6 +390,10 @@ run_runner_only() {
     fi
     if [[ -n "$RESTORE_CHECKPOINT" ]]; then
       extra_args+=(--restore-checkpoint "$RESTORE_CHECKPOINT")
+    fi
+    extra_args+=(--restore-dispatch "$RESTORE_DISPATCH")
+    if [[ -n "$GUEST_FILE_DISK_IMAGE" ]]; then
+      extra_args+=(--guest-file-disk-image "$GUEST_FILE_DISK_IMAGE")
     fi
     if [[ -n "$GUEST_CFLAGS" ]]; then
       extra_args+=(--guest-cflags "$GUEST_CFLAGS")

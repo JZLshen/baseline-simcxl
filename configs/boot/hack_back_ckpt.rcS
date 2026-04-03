@@ -33,7 +33,7 @@ fi
 
 wait_for_guest_ready() {
 	ready_tries="${CHECKPOINT_READY_TRIES:-300}"
-	settle_secs="${CHECKPOINT_SETTLE_SECS:-5}"
+	settle_secs="${CHECKPOINT_SETTLE_SECS:-30}"
 
 	echo "Waiting for Linux userspace readiness before checkpoint..."
 
@@ -46,6 +46,7 @@ wait_for_guest_ready() {
 				running|degraded)
 					echo "Guest ready for checkpoint: state=${state}; settling ${settle_secs}s"
 					sleep "$settle_secs"
+					sync
 					return 0
 					;;
 			esac

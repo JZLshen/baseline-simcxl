@@ -33,9 +33,17 @@ Options:
   --restore-checkpoint <dir>
                            Restore from an existing boot checkpoint and start
                            directly with CPU_TYPE cores.
+  --restore-dispatch <mode>
+                           Restored workload dispatch: readfile or guest-file.
+                           Default: readfile
+  --guest-file-disk-image <path>
+                           Reusable private disk image used by guest-file
+                           restore dispatch. When omitted, guest-file mode
+                           creates a per-outdir copy.
   --terminal-port <N>      Host TCP port reserved for the guest COM1 listener. Default: auto-pick
   --guest-cflags <flags>   Host gcc flags used to build the injected guest binary.
                            Default: -O2 -Wall -static -g -pthread
+  --guest-trace            Enable extra guest-side stage traces on ttyS0.
   --skip-image-setup       Reuse the coherent dedicated guest binary already injected into the disk image.
   --debug-flags <list>     Optional gem5 debug flags.
   --skip-build             Skip scons build.
@@ -47,7 +55,9 @@ Fixed resources:
 
 The coherent dedicated guest binary is built on the host, injected into the
 disk image, then launched from a small readfile workload after the first m5
-exit switches from BOOT_CPU to CPU_TYPE.
+exit switches from BOOT_CPU to CPU_TYPE. Ruby restore can hang in m5 readfile,
+so guest-file dispatch instead runs a guest-resident autorun wrapper from a
+private disk image copy.
 EOF
 }
 
@@ -77,8 +87,11 @@ CXL_NODE=1
 NUM_CPUS=0
 SERVER_CPU=-1
 RESTORE_CHECKPOINT=""
+RESTORE_DISPATCH="readfile"
+GUEST_FILE_DISK_IMAGE=""
 TERMINAL_PORT=0
 GUEST_CFLAGS=""
+GUEST_TRACE=0
 SKIP_IMAGE_SETUP=0
 DEBUG_FLAGS=""
 SKIP_BUILD=0
@@ -169,6 +182,14 @@ while [[ $# -gt 0 ]]; do
       RESTORE_CHECKPOINT="$2"
       shift 2
       ;;
+    --restore-dispatch)
+      RESTORE_DISPATCH="$2"
+      shift 2
+      ;;
+    --guest-file-disk-image)
+      GUEST_FILE_DISK_IMAGE="$2"
+      shift 2
+      ;;
     --terminal-port)
       TERMINAL_PORT="$2"
       shift 2
@@ -176,6 +197,10 @@ while [[ $# -gt 0 ]]; do
     --guest-cflags)
       GUEST_CFLAGS="$2"
       shift 2
+      ;;
+    --guest-trace)
+      GUEST_TRACE=1
+      shift 1
       ;;
     --skip-image-setup)
       SKIP_IMAGE_SETUP=1
@@ -206,9 +231,6 @@ if [[ -z "$GUEST_CFLAGS" ]]; then
 fi
 
 if [[ "$NUM_CPUS" -eq 0 ]]; then
-  # Leave one extra guest CPU so the parent barrier/waitpid process does not
-  # contend with the pinned client/server workers at higher client counts.
-  # Keep at least four guest CPUs; odd-sized auto layouts have not been stable.
   NUM_CPUS=$((CLIENT_COUNT + 2))
   if [[ "$NUM_CPUS" -lt 4 ]]; then
     NUM_CPUS=4
@@ -228,6 +250,20 @@ if [[ -n "$RESTORE_CHECKPOINT" ]]; then
     exit 1
   fi
   RESTORE_CHECKPOINT="$(cd "$RESTORE_CHECKPOINT" && pwd)"
+fi
+
+case "$RESTORE_DISPATCH" in
+  readfile|guest-file)
+    ;;
+  *)
+    echo "unsupported --restore-dispatch: $RESTORE_DISPATCH" >&2
+    exit 1
+    ;;
+esac
+
+if [[ "$RESTORE_DISPATCH" == "guest-file" && -z "$RESTORE_CHECKPOINT" ]]; then
+  echo "--restore-dispatch guest-file requires --restore-checkpoint" >&2
+  exit 1
 fi
 
 EXPECTED_TOTAL_REQUESTS=$((CLIENT_COUNT * COUNT_PER_CLIENT))
@@ -258,7 +294,7 @@ PY
 )"
 fi
 
-if [[ "$SKIP_IMAGE_SETUP" -eq 0 || ( -z "$RESTORE_CHECKPOINT" && "$BOOT_CPU" == "KVM" ) ]]; then
+if [[ "$SKIP_IMAGE_SETUP" -eq 0 || ( -z "$RESTORE_CHECKPOINT" && "$BOOT_CPU" == "KVM" ) || "$RESTORE_DISPATCH" == "guest-file" ]]; then
   if ! sudo -n true >/dev/null 2>&1; then
     echo "coherent dedicated runner requires passwordless sudo or a live sudo ticket" >&2
     exit 1
@@ -268,34 +304,48 @@ fi
 mkdir -p "$OUTDIR"
 OUTDIR="$(cd "$OUTDIR" && pwd)"
 
+if [[ -n "$GUEST_FILE_DISK_IMAGE" ]]; then
+  mkdir -p "$(dirname "$GUEST_FILE_DISK_IMAGE")"
+  GUEST_FILE_DISK_IMAGE="$(readlink -f "$GUEST_FILE_DISK_IMAGE")"
+fi
+
 GEM5_LOG="$OUTDIR/gem5.stdout"
 LOG_PATH="$OUTDIR/board.pc.com_1.device"
 RESULT_LOG_PATH="$OUTDIR/hydrarpc_dedicated_coherent.result.log"
+RUNTIME_DISK_IMAGE="$DISK_IMAGE"
 
 gem5_launcher=("$BINARY")
 if [[ -z "$RESTORE_CHECKPOINT" && "$BOOT_CPU" == "KVM" ]]; then
   gem5_launcher=(sudo -n "$BINARY")
 fi
 
-if [[ "$SKIP_IMAGE_SETUP" -eq 0 ]]; then
+if [[ "$SKIP_IMAGE_SETUP" -eq 0 && "$RESTORE_DISPATCH" != "guest-file" ]]; then
   HYDRARPC_GUEST_CFLAGS="$GUEST_CFLAGS" \
     bash tools/setup_hydrarpc_dedicated_coherent_disk_image.sh "$DISK_IMAGE"
 fi
 
 GUEST_CMD="/home/test_code/run_hydrarpc_dedicated_coherent.sh --client-count ${CLIENT_COUNT} --count-per-client ${COUNT_PER_CLIENT} --window-size ${WINDOW_SIZE} --slot-count ${SLOT_COUNT} --req-bytes ${REQ_BYTES} --resp-bytes ${RESP_BYTES} --slow-client-count ${SLOW_CLIENT_COUNT} --slow-count-per-client ${SLOW_COUNT_PER_CLIENT} --slow-send-gap-ns ${SLOW_SEND_GAP_NS} --send-mode ${SEND_MODE} --send-gap-ns ${SEND_GAP_NS} --request-transfer-mode ${REQUEST_TRANSFER_MODE} --response-transfer-mode ${RESPONSE_TRANSFER_MODE} --cxl-node ${CXL_NODE} --server-cpu ${SERVER_CPU}"
+GUEST_RESTORE_CMD="/home/test_code/hydrarpc_dedicated_coherent --client-count ${CLIENT_COUNT} --count-per-client ${COUNT_PER_CLIENT} --window-size ${WINDOW_SIZE} --slot-count ${SLOT_COUNT} --req-bytes ${REQ_BYTES} --resp-bytes ${RESP_BYTES} --slow-client-count ${SLOW_CLIENT_COUNT} --slow-count-per-client ${SLOW_COUNT_PER_CLIENT} --slow-send-gap-ns ${SLOW_SEND_GAP_NS} --send-mode ${SEND_MODE} --send-gap-ns ${SEND_GAP_NS} --request-transfer-mode ${REQUEST_TRANSFER_MODE} --response-transfer-mode ${RESPONSE_TRANSFER_MODE} --cxl-node ${CXL_NODE} --server-cpu ${SERVER_CPU}"
+if [[ "$GUEST_TRACE" -eq 1 ]]; then
+  GUEST_CMD="env HYDRARPC_TRACE=1 ${GUEST_CMD}"
+  GUEST_RESTORE_CMD="env HYDRARPC_TRACE=1 ${GUEST_RESTORE_CMD}"
+fi
 WORKLOAD_FILE="$OUTDIR/hydrarpc_dedicated_coherent.runscript"
 RESTORE_WORKLOAD_FILE="$OUTDIR/hydrarpc_dedicated_coherent.restore.runscript"
+RESTORE_AUTORUN_CMD_FILE="$OUTDIR/hydrarpc_dedicated_coherent.restore.autorun.sh"
 
 {
   printf "#!/bin/sh\n"
   printf "set -eu\n"
   printf "exec >/dev/ttyS0 2>&1\n"
+  printf "printf 'guest_workload_bootstrap_enter\\n'\n"
   printf "ready_tries=300\n"
   printf "while [ \"\$ready_tries\" -gt 0 ]; do\n"
   printf "  state=\$(systemctl is-system-running 2>/dev/null || true)\n"
   printf "  if systemctl is-active --quiet multi-user.target; then\n"
   printf "    case \"\$state\" in\n"
   printf "      running|degraded)\n"
+  printf "        printf 'guest_workload_ready state=%%s\\n' \"\$state\"\n"
   printf "        break\n"
   printf "        ;;\n"
   printf "    esac\n"
@@ -308,11 +358,15 @@ RESTORE_WORKLOAD_FILE="$OUTDIR/hydrarpc_dedicated_coherent.restore.runscript"
   printf "  sleep 1\n"
   printf "done\n"
   if [[ -z "$RESTORE_CHECKPOINT" ]]; then
+    printf "printf 'guest_workload_pre_switch_exit\\n'\n"
     printf "/sbin/m5 exit\n"
+    printf "printf 'guest_workload_post_switch_resume\\n'\n"
   fi
+  printf "printf 'guest_workload_before_cmd\\n'\n"
   printf "set +e\n"
   printf "%s\n" "$GUEST_CMD"
   printf "rc=\$?\n"
+  printf "printf 'guest_workload_after_cmd rc=%%s\\n' \"\$rc\"\n"
   printf "printf 'guest_command_rc=%%s\\\\n' \"\$rc\"\n"
   printf "/sbin/m5 exit\n"
 } > "$WORKLOAD_FILE"
@@ -321,12 +375,65 @@ RESTORE_WORKLOAD_FILE="$OUTDIR/hydrarpc_dedicated_coherent.restore.runscript"
   printf "#!/bin/sh\n"
   printf "set -eu\n"
   printf "exec >/dev/ttyS0 2>&1\n"
+  printf "printf 'guest_restore_workload_start\\n'\n"
+  printf "printf 'guest_restore_workload_before_cmd\\n'\n"
   printf "set +e\n"
   printf "%s\n" "$GUEST_CMD"
   printf "rc=\$?\n"
+  printf "printf 'guest_restore_workload_after_cmd rc=%%s\\n' \"\$rc\"\n"
   printf "printf 'guest_command_rc=%%s\\\\n' \"\$rc\"\n"
   printf "/sbin/m5 exit\n"
 } > "$RESTORE_WORKLOAD_FILE"
+
+{
+  printf "#!/bin/sh\n"
+  printf "set -eu\n"
+  printf "printf 'guest_restore_cmd_start\\n'\n"
+  printf "sync\n"
+  printf "echo 3 > /proc/sys/vm/drop_caches || true\n"
+  printf "set +e\n"
+  printf "%s\n" "$GUEST_RESTORE_CMD"
+  printf "rc=\$?\n"
+  printf "printf 'guest_restore_cmd_after_run rc=%%s\\\\n' \"\$rc\"\n"
+  printf "printf 'guest_restore_cmd_rc=%%s\\\\n' \"\$rc\"\n"
+  printf "printf 'guest_command_rc=%%s\\\\n' \"\$rc\"\n"
+  printf "/sbin/m5 exit\n"
+} > "$RESTORE_AUTORUN_CMD_FILE"
+
+chmod 755 "$WORKLOAD_FILE" "$RESTORE_WORKLOAD_FILE" "$RESTORE_AUTORUN_CMD_FILE"
+
+prepare_guest_file_restore_image() {
+  local image_copy="$OUTDIR/parsec.img"
+
+  if [[ -n "$GUEST_FILE_DISK_IMAGE" ]]; then
+    image_copy="$GUEST_FILE_DISK_IMAGE"
+  else
+    rm -f "$image_copy"
+  fi
+
+  if [[ ! -f "$image_copy" ]]; then
+    cp --reflink=auto "$DISK_IMAGE" "$image_copy"
+  fi
+
+  if [[ "$SKIP_IMAGE_SETUP" -eq 0 ]]; then
+    if [[ -n "$GUEST_CFLAGS" ]]; then
+      env HYDRARPC_GUEST_CFLAGS="$GUEST_CFLAGS" \
+        bash tools/setup_hydrarpc_dedicated_coherent_disk_image.sh "$image_copy"
+    else
+      bash tools/setup_hydrarpc_dedicated_coherent_disk_image.sh "$image_copy"
+    fi
+  fi
+
+  bash tools/install_hydrarpc_restore_autorun_in_image.sh \
+    "$image_copy" \
+    "$RESTORE_AUTORUN_CMD_FILE"
+
+  RUNTIME_DISK_IMAGE="$image_copy"
+}
+
+if [[ "$RESTORE_DISPATCH" == "guest-file" ]]; then
+  prepare_guest_file_restore_image
+fi
 
 gem5_args=(
   -d "$OUTDIR"
@@ -342,15 +449,22 @@ gem5_args+=(
   --cpu_type "$CPU_TYPE"
   --num_cpus "$NUM_CPUS"
   --kernel "$KERNEL"
-  --disk-image "$DISK_IMAGE"
+  --disk-image "$RUNTIME_DISK_IMAGE"
   --terminal-port "$TERMINAL_PORT"
 )
 
 if [[ -n "$RESTORE_CHECKPOINT" ]]; then
-  gem5_args+=(
-    --restore-checkpoint "$RESTORE_CHECKPOINT"
-    --workload-file "$RESTORE_WORKLOAD_FILE"
-  )
+  if [[ "$RESTORE_DISPATCH" == "guest-file" ]]; then
+    gem5_args+=(
+      --restore-checkpoint "$RESTORE_CHECKPOINT"
+      --disable-workload
+    )
+  else
+    gem5_args+=(
+      --restore-checkpoint "$RESTORE_CHECKPOINT"
+      --workload-file "$RESTORE_WORKLOAD_FILE"
+    )
+  fi
 else
   gem5_args+=(
     --boot_cpu "$BOOT_CPU"

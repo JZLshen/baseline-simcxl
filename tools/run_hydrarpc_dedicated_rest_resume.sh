@@ -182,8 +182,8 @@ run_dedicated_sweep() {
   bash tools/run_hydrarpc_sweep.sh \
     --root-outdir "$root_outdir" \
     --parallel-jobs "$per_jobs" \
-    "$@" \
     "${COMMON_DEDICATED[@]}" \
+    "$@" \
     "${EXTRA_SWEEP_ARGS[@]}"
 }
 
@@ -257,19 +257,21 @@ run_sparse_point() {
 }
 
 run_ring_sweep() {
-  local per_jobs="$1"
+  local point_cap="$1"
   local ring_size=""
 
   for ring_size in 16 32 64 128 256 512; do
-    run_dedicated_sweep "$per_jobs" \
+    run_dedicated_sweep 1 \
       "$ROOT_OUTDIR/sensitivity/ringsize_s${ring_size}" \
       --client-counts "32" \
       --slot-count "$ring_size" \
       --req-bytes 64 \
       --resp-bytes 64 \
       --request-transfer-mode staging \
-      --response-transfer-mode staging
+      --response-transfer-mode staging &
+    wait_for_onepoint_cap "$point_cap"
   done
+  wait_for_all_background
 }
 
 run_size_points_phase() {

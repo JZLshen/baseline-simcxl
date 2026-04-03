@@ -210,8 +210,8 @@ run_shared_sweep() {
   bash tools/run_hydrarpc_sweep.sh \
     --root-outdir "$root_outdir" \
     --parallel-jobs "$per_jobs" \
-    "$@" \
     "${COMMON_SHARED[@]}" \
+    "$@" \
     "${EXTRA_SWEEP_ARGS[@]}"
 }
 

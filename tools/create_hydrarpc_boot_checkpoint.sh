@@ -16,6 +16,8 @@ Options:
                            Default: 34
   --kernel <path>          Kernel image. Default: repo-local files/vmlinux
   --disk-image <path>      Disk image. Default: repo-local files/parsec.img
+  --checkpoint-boot-script <path>
+                           Optional script used instead of configs/boot/hack_back_ckpt.rcS.
   --terminal-port <N>      Terminal port. Default: auto-pick
   --skip-build             Skip scons build.
   --help                   Show this message.
@@ -35,6 +37,7 @@ BOOT_CPU="KVM"
 NUM_CPUS=34
 KERNEL="${REPO_ROOT}/files/vmlinux"
 DISK_IMAGE="${REPO_ROOT}/files/parsec.img"
+CHECKPOINT_BOOT_SCRIPT=""
 TERMINAL_PORT=0
 SKIP_BUILD=0
 
@@ -66,6 +69,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --disk-image)
       DISK_IMAGE="$2"
+      shift 2
+      ;;
+    --checkpoint-boot-script)
+      CHECKPOINT_BOOT_SCRIPT="$2"
       shift 2
       ;;
     --terminal-port)
@@ -166,6 +173,12 @@ gem5_args=(
   --checkpoint-boot
   --terminal-port "$TERMINAL_PORT"
 )
+
+if [[ -n "$CHECKPOINT_BOOT_SCRIPT" ]]; then
+  gem5_args+=(
+    --checkpoint-boot-script "$CHECKPOINT_BOOT_SCRIPT"
+  )
+fi
 
 if ! "${gem5_launcher[@]}" "${gem5_args[@]}" >"$GEM5_LOG" 2>&1; then
   echo "checkpoint creation failed" >&2
