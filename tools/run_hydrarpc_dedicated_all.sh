@@ -151,6 +151,24 @@ COMMON_DEDICATED=(
 )
 EXTRA_SWEEP_ARGS=()
 EXTRA_APP_ARGS=()
+OVERALL_CLIENT_COUNTS="1 2 4 8 16 32"
+APP_PROFILES="ycsb_a_1k ycsb_b_1k ycsb_c_1k ycsb_f_1k udb_ro"
+OVERALL_REQ1530_RESP315_UNIFORM_ARGS=(
+  --req-bytes 1530
+  --resp-bytes 315
+  --req-min-bytes 765
+  --req-max-bytes 2295
+  --resp-min-bytes 158
+  --resp-max-bytes 472
+)
+OVERALL_REQ38_RESP230_UNIFORM_ARGS=(
+  --req-bytes 38
+  --resp-bytes 230
+  --req-min-bytes 19
+  --req-max-bytes 57
+  --resp-min-bytes 115
+  --resp-max-bytes 345
+)
 if [[ "$CONTINUE_ON_FAILURE" -eq 1 ]]; then
   EXTRA_SWEEP_ARGS+=(--continue-on-failure)
   EXTRA_APP_ARGS+=(--continue-on-failure)
@@ -166,7 +184,7 @@ echo "CKPT_CLASSIC=$CKPT_CLASSIC"
 
 bash tools/run_hydrarpc_sweep.sh \
   --root-outdir "$ROOT_OUTDIR/overall/req64_resp64" \
-  --client-counts "1 2 4 8 16 32" \
+  --client-counts "$OVERALL_CLIENT_COUNTS" \
   --req-bytes 64 \
   --resp-bytes 64 \
   --request-transfer-mode staging \
@@ -176,13 +194,8 @@ bash tools/run_hydrarpc_sweep.sh \
 
 bash tools/run_hydrarpc_sweep.sh \
   --root-outdir "$ROOT_OUTDIR/overall/req1530_resp315_uniform" \
-  --client-counts "1 2 4 8 16 32" \
-  --req-bytes 1530 \
-  --resp-bytes 315 \
-  --req-min-bytes 765 \
-  --req-max-bytes 2295 \
-  --resp-min-bytes 158 \
-  --resp-max-bytes 472 \
+  --client-counts "$OVERALL_CLIENT_COUNTS" \
+  "${OVERALL_REQ1530_RESP315_UNIFORM_ARGS[@]}" \
   --request-transfer-mode staging \
   --response-transfer-mode staging \
   "${COMMON_DEDICATED[@]}" \
@@ -190,13 +203,8 @@ bash tools/run_hydrarpc_sweep.sh \
 
 bash tools/run_hydrarpc_sweep.sh \
   --root-outdir "$ROOT_OUTDIR/overall/req38_resp230_uniform" \
-  --client-counts "1 2 4 8 16 32" \
-  --req-bytes 38 \
-  --resp-bytes 230 \
-  --req-min-bytes 19 \
-  --req-max-bytes 57 \
-  --resp-min-bytes 115 \
-  --resp-max-bytes 345 \
+  --client-counts "$OVERALL_CLIENT_COUNTS" \
+  "${OVERALL_REQ38_RESP230_UNIFORM_ARGS[@]}" \
   --request-transfer-mode staging \
   --response-transfer-mode staging \
   "${COMMON_DEDICATED[@]}" \
@@ -247,7 +255,7 @@ for ring_size in 16 32 64 128 256 512; do
     "${EXTRA_SWEEP_ARGS[@]}"
 done
 
-for slow_count_per_client in 8 15 30; do
+for slow_count_per_client in 8 15; do
   for slow_client_count in 4 8 16 20 24 28; do
     bash tools/run_hydrarpc_sweep.sh \
       --root-outdir "$ROOT_OUTDIR/sensitivity/sparse32_sc${slow_client_count}_sq${slow_count_per_client}" \
@@ -280,7 +288,7 @@ done
 bash tools/run_hydrarpc_app_sweep.sh \
   --root-outdir "$ROOT_OUTDIR/application" \
   --client-counts "32" \
-  --profiles "ycsb_a_1k ycsb_b_1k ycsb_c_1k ycsb_f_1k udb_ro" \
+  --profiles "$APP_PROFILES" \
   --kinds dedicated \
   --count-per-client "$COUNT_PER_CLIENT" \
   --cpu-type TIMING \

@@ -749,6 +749,7 @@ init_app_runtime(struct AppRuntime *runtime,
                 client_request_count,
                 profile->name,
                 record_count,
+                client_id,
                 key_size,
                 value_size,
                 runtime->max_key_size,
@@ -1065,7 +1066,8 @@ build_client_request_payload(const struct AppRuntime *app_runtime,
     built_len = hydrarpc_apprt_encode_request(request_shadow,
                                               (size_t)request_payload_size,
                                               op,
-                                              app_runtime->dataset_seed);
+                                              app_runtime->dataset_seed,
+                                              &app_runtime->store);
     if (built_len != request_payload_size)
         return -1;
 

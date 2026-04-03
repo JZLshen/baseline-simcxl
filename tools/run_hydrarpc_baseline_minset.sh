@@ -29,7 +29,7 @@ Fixed experiment contract:
   - slot-count = 1024
   - no 3-client point
   - no slow16 group
-  - sparse32 slow-count-per-client in {8, 15, 30}
+  - sparse32 slow-count-per-client in {8, 15}
 EOF
 }
 
@@ -232,7 +232,7 @@ run_sparse32_group() {
   local slow_count_per_client=""
   local args=()
 
-  for slow_count_per_client in 8 15 30; do
+  for slow_count_per_client in 8 15; do
     for slow_client_count in 4 8 16 20 24 28; do
       args=(bash tools/run_hydrarpc_sweep.sh
         --root-outdir "$ROOT_OUTDIR/sparse32_dedicated_shared_c32_sc${slow_client_count}_sq${slow_count_per_client}"

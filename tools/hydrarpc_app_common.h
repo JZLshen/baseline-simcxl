@@ -11,7 +11,7 @@
 #define HYDRARPC_APP_PROFILE_YCSB_F_1K "ycsb_f_1k"
 #define HYDRARPC_APP_PROFILE_UDB_RO "udb_ro"
 
-#define HYDRARPC_APP_DEFAULT_RECORD_COUNT 100000ULL
+#define HYDRARPC_APP_DEFAULT_RECORD_COUNT 10000ULL
 #define HYDRARPC_APP_DEFAULT_DATASET_SEED 0x9B5D3A4781C26EF1ULL
 #define HYDRARPC_APP_DEFAULT_WORKLOAD_SEED 0xC7D51A32049EF68BULL
 #define HYDRARPC_APP_DEFAULT_ZIPF_THETA 0.99
@@ -21,6 +21,7 @@
 #define HYDRARPC_APP_DEFAULT_UDB_VALUE_SIZE 127U
 #define HYDRARPC_APP_DEFAULT_UDB_MAX_KEY_SIZE 39U
 #define HYDRARPC_APP_DEFAULT_UDB_MAX_VALUE_SIZE 179U
+#define HYDRARPC_APP_UDB_BIN_COUNT 10U
 #define HYDRARPC_APP_MAX_KEY_SIZE 255U
 
 #define HYDRARPC_APP_OP_GET 1u
@@ -62,6 +63,14 @@ typedef struct __attribute__((packed)) {
     uint32_t value_len;
     uint64_t value_checksum;
 } hydrarpc_app_response_hdr_t;
+
+static const uint16_t hydrarpc_app_udb_key_lengths[HYDRARPC_APP_UDB_BIN_COUNT] = {
+    16u, 18u, 21u, 23u, 26u, 28u, 31u, 33u, 36u, 39u,
+};
+
+static const uint16_t hydrarpc_app_udb_value_lengths[HYDRARPC_APP_UDB_BIN_COUNT] = {
+    74u, 86u, 97u, 109u, 121u, 133u, 145u, 156u, 167u, 179u,
+};
 
 static inline uint64_t
 hydrarpc_app_rotl64(uint64_t v, unsigned int shift)
@@ -206,18 +215,47 @@ hydrarpc_app_profile_max_value_size(const char *name,
 }
 
 static inline size_t
-hydrarpc_app_select_discrete_length(uint64_t selector_seed, uint64_t key_id,
-                                    const uint16_t *choices,
-                                    size_t choice_count)
+hydrarpc_app_select_discrete_index(uint64_t selector_seed, uint64_t key_id,
+                                   size_t choice_count)
 {
     uint64_t mixed;
 
-    if (!choices || choice_count == 0)
+    if (choice_count == 0)
         return 0;
 
     mixed = hydrarpc_app_mix64(selector_seed ^
                                (key_id * 0x9E3779B185EBCA87ULL));
-    return (size_t)choices[mixed % choice_count];
+    return (size_t)(mixed % choice_count);
+}
+
+static inline size_t
+hydrarpc_app_select_discrete_length(uint64_t selector_seed, uint64_t key_id,
+                                    const uint16_t *choices,
+                                    size_t choice_count)
+{
+    if (!choices || choice_count == 0)
+        return 0;
+
+    return (size_t)choices[hydrarpc_app_select_discrete_index(
+        selector_seed, key_id, choice_count)];
+}
+
+static inline size_t
+hydrarpc_app_udb_key_bin_index(uint64_t dataset_seed, uint64_t key_id)
+{
+    return hydrarpc_app_select_discrete_index(
+        dataset_seed ^ 0xB8FE6C391B5C4F2DULL,
+        key_id,
+        HYDRARPC_APP_UDB_BIN_COUNT);
+}
+
+static inline size_t
+hydrarpc_app_udb_value_bin_index(uint64_t dataset_seed, uint64_t key_id)
+{
+    return hydrarpc_app_select_discrete_index(
+        dataset_seed ^ 0x4F1BBCDCBFA54001ULL,
+        key_id,
+        HYDRARPC_APP_UDB_BIN_COUNT);
 }
 
 static inline void
@@ -227,26 +265,25 @@ hydrarpc_app_record_layout(const char *profile_name, uint64_t dataset_seed,
                            size_t *out_value_len)
 {
     if (hydrarpc_app_profile_has_variable_layout(profile_name)) {
-        static const uint16_t udb_key_lengths[] = {
-            16u, 20u, 24u, 24u, 28u, 28u, 28u, 32u, 32u, 39u,
-        };
-        static const uint16_t udb_value_lengths[] = {
-            80u, 96u, 112u, 112u, 128u, 128u, 128u, 144u, 160u, 179u,
-        };
-
+        /*
+         * Use equal-probability bins for the UDB profile so the dataset layout
+         * follows the same "uniform bins with the right average" contract as
+         * the dedicated uniform payload experiments. The chosen bins keep the
+         * mean close to the FAST'20 UDB RO point: key=27.1B, value=126.7B.
+         */
         if (out_key_len) {
             *out_key_len = hydrarpc_app_select_discrete_length(
                 dataset_seed ^ 0xB8FE6C391B5C4F2DULL,
                 key_id,
-                udb_key_lengths,
-                sizeof(udb_key_lengths) / sizeof(udb_key_lengths[0]));
+                hydrarpc_app_udb_key_lengths,
+                HYDRARPC_APP_UDB_BIN_COUNT);
         }
         if (out_value_len) {
             *out_value_len = hydrarpc_app_select_discrete_length(
                 dataset_seed ^ 0x4F1BBCDCBFA54001ULL,
                 key_id,
-                udb_value_lengths,
-                sizeof(udb_value_lengths) / sizeof(udb_value_lengths[0]));
+                hydrarpc_app_udb_value_lengths,
+                HYDRARPC_APP_UDB_BIN_COUNT);
         }
         return;
     }

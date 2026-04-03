@@ -35,6 +35,24 @@ SKIP_IMAGE_SETUP=0
 SKIP_EXISTING=0
 CONTINUE_ON_FAILURE=0
 ANY_FAILURES=0
+OVERALL_CLIENT_COUNTS="1 2 4 8 16 32"
+APP_PROFILES="ycsb_a_1k ycsb_b_1k ycsb_c_1k ycsb_f_1k udb_ro"
+OVERALL_REQ1530_RESP315_UNIFORM_ARGS=(
+  --req-bytes 1530
+  --resp-bytes 315
+  --req-min-bytes 765
+  --req-max-bytes 2295
+  --resp-min-bytes 158
+  --resp-max-bytes 472
+)
+OVERALL_REQ38_RESP230_UNIFORM_ARGS=(
+  --req-bytes 38
+  --resp-bytes 230
+  --req-min-bytes 19
+  --req-max-bytes 57
+  --resp-min-bytes 115
+  --resp-max-bytes 345
+)
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -193,7 +211,7 @@ run_dedicated_app() {
   bash tools/run_hydrarpc_app_sweep.sh \
     --root-outdir "$ROOT_OUTDIR/application" \
     --client-counts "32" \
-    --profiles "ycsb_a_1k ycsb_b_1k ycsb_c_1k ycsb_f_1k udb_ro" \
+    --profiles "$APP_PROFILES" \
     --kinds dedicated \
     --count-per-client "$COUNT_PER_CLIENT" \
     --cpu-type TIMING \
@@ -306,7 +324,7 @@ run_sparse_points_phase() {
   local slow_count_per_client=""
   local slow_client_count=""
 
-  for slow_count_per_client in 8 15 30; do
+  for slow_count_per_client in 8 15; do
     for slow_client_count in 4 8 16 20 24 28; do
       run_sparse_point "$slow_client_count" "$slow_count_per_client" &
       wait_for_onepoint_cap "$point_cap"
@@ -326,31 +344,21 @@ run_overall_phase() {
 
     run_dedicated_sweep "$per_sweep_jobs" \
       "$ROOT_OUTDIR/overall/req64_resp64" \
-      --client-counts "1 2 4 8 16 32" \
+      --client-counts "$OVERALL_CLIENT_COUNTS" \
       --req-bytes 64 \
       --resp-bytes 64 \
       --request-transfer-mode staging \
       --response-transfer-mode staging &
     run_dedicated_sweep "$per_sweep_jobs" \
       "$ROOT_OUTDIR/overall/req1530_resp315_uniform" \
-      --client-counts "1 2 4 8 16 32" \
-      --req-bytes 1530 \
-      --resp-bytes 315 \
-      --req-min-bytes 765 \
-      --req-max-bytes 2295 \
-      --resp-min-bytes 158 \
-      --resp-max-bytes 472 \
+      --client-counts "$OVERALL_CLIENT_COUNTS" \
+      "${OVERALL_REQ1530_RESP315_UNIFORM_ARGS[@]}" \
       --request-transfer-mode staging \
       --response-transfer-mode staging &
     run_dedicated_sweep "$per_sweep_jobs" \
       "$ROOT_OUTDIR/overall/req38_resp230_uniform" \
-      --client-counts "1 2 4 8 16 32" \
-      --req-bytes 38 \
-      --resp-bytes 230 \
-      --req-min-bytes 19 \
-      --req-max-bytes 57 \
-      --resp-min-bytes 115 \
-      --resp-max-bytes 345 \
+      --client-counts "$OVERALL_CLIENT_COUNTS" \
+      "${OVERALL_REQ38_RESP230_UNIFORM_ARGS[@]}" \
       --request-transfer-mode staging \
       --response-transfer-mode staging &
     wait_for_all_background
@@ -359,31 +367,21 @@ run_overall_phase() {
 
   run_dedicated_sweep "$PARALLEL_JOBS" \
     "$ROOT_OUTDIR/overall/req64_resp64" \
-    --client-counts "1 2 4 8 16 32" \
+    --client-counts "$OVERALL_CLIENT_COUNTS" \
     --req-bytes 64 \
     --resp-bytes 64 \
     --request-transfer-mode staging \
     --response-transfer-mode staging
   run_dedicated_sweep "$PARALLEL_JOBS" \
     "$ROOT_OUTDIR/overall/req1530_resp315_uniform" \
-    --client-counts "1 2 4 8 16 32" \
-    --req-bytes 1530 \
-    --resp-bytes 315 \
-    --req-min-bytes 765 \
-    --req-max-bytes 2295 \
-    --resp-min-bytes 158 \
-    --resp-max-bytes 472 \
+    --client-counts "$OVERALL_CLIENT_COUNTS" \
+    "${OVERALL_REQ1530_RESP315_UNIFORM_ARGS[@]}" \
     --request-transfer-mode staging \
     --response-transfer-mode staging
   run_dedicated_sweep "$PARALLEL_JOBS" \
     "$ROOT_OUTDIR/overall/req38_resp230_uniform" \
-    --client-counts "1 2 4 8 16 32" \
-    --req-bytes 38 \
-    --resp-bytes 230 \
-    --req-min-bytes 19 \
-    --req-max-bytes 57 \
-    --resp-min-bytes 115 \
-    --resp-max-bytes 345 \
+    --client-counts "$OVERALL_CLIENT_COUNTS" \
+    "${OVERALL_REQ38_RESP230_UNIFORM_ARGS[@]}" \
     --request-transfer-mode staging \
     --response-transfer-mode staging
 }

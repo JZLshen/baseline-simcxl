@@ -46,16 +46,6 @@ run_case c32_ringsize_s16 \
   --resp-bytes 64 \
   --slot-count 16
 
-run_case c32_sparse_sc20_sq30 \
-  --client-count 32 \
-  --num-cpus 34 \
-  --checkpoint-id atomic_n34 \
-  --req-bytes 64 \
-  --resp-bytes 64 \
-  --slow-client-count 20 \
-  --slow-count-per-client 30 \
-  --slow-send-gap-ns 20000
-
 run_case c32_sparse_sc8_sq15 \
   --client-count 32 \
   --num-cpus 34 \

@@ -10,11 +10,12 @@ Options:
   --root-outdir <dir>      Root output directory.
   --count-per-client <N>   Requests per client. Default: 30
   --client-counts <list>   Quoted list, e.g. "32"
-  --profiles <list>        Quoted list from "ycsb_a_1k ycsb_b_1k ycsb_c_1k ycsb_f_1k udb_ro"
+  --profiles <list>        Quoted list from the current supported set:
+                           "ycsb_a_1k ycsb_b_1k ycsb_c_1k ycsb_f_1k udb_ro"
   --kinds <list>           Quoted list from "dedicated shared". Default: both
   --window-size <N>        Max outstanding requests per client. Default: 16
   --slot-count <N>         Ring depth passed to both shared and dedicated. Default: 1024
-  --record-count <N>       Application KV record count. Default: 100000
+  --record-count <N>       Application KV record count. Default: 10000
   --dataset-seed <N>       Dataset seed passed into app binaries. Default: 0x9B5D3A4781C26EF1
   --workload-seed <N>      Workload seed passed into app binaries. Default: 0xC7D51A32049EF68B
   --cpu-type <type>        Switch CPU type passed to runners. Default: TIMING
@@ -40,11 +41,12 @@ EOF
 ROOT_OUTDIR=""
 COUNT_PER_CLIENT=30
 CLIENT_COUNTS="32"
-PROFILES="ycsb_a_1k ycsb_b_1k ycsb_c_1k ycsb_f_1k udb_ro"
+APP_PROFILES_DEFAULT="ycsb_a_1k ycsb_b_1k ycsb_c_1k ycsb_f_1k udb_ro"
+PROFILES="$APP_PROFILES_DEFAULT"
 KINDS="dedicated shared"
 WINDOW_SIZE=16
 SLOT_COUNT=1024
-RECORD_COUNT=100000
+RECORD_COUNT=10000
 DATASET_SEED="0x9B5D3A4781C26EF1"
 WORKLOAD_SEED="0xC7D51A32049EF68B"
 CPU_TYPE="TIMING"
@@ -166,6 +168,7 @@ fi
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
   scons build/X86/gem5.opt -j"$(nproc)"
+  touch build/X86/gem5.opt
 else
   bash tools/check_gem5_binary_freshness.sh \
     --binary "build/X86/gem5.opt" \

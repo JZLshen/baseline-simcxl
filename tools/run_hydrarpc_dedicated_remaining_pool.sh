@@ -274,7 +274,7 @@ done
 for latency in 100ns 200ns 300ns; do
   launch_latency_point "$latency"
 done
-for slow_count_per_client in 8 15 30; do
+for slow_count_per_client in 8 15; do
   for slow_client_count in 4 8 16 20 24 28; do
     launch_sparse_point "$slow_client_count" "$slow_count_per_client"
   done

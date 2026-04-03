@@ -21,7 +21,7 @@ Options:
   --help                   Show this message.
 
 Supported exp.txt-aligned groups:
-  - motivation shared competition
+  - motivation shared competition + response-size
   - overall
   - req-size
   - resp-size
@@ -235,11 +235,23 @@ run_shared_app() {
 }
 
 run_motivation_phase() {
+  local resp_bytes=""
+
   run_shared_sweep "$PARALLEL_JOBS" \
     "$ROOT_OUTDIR/motivation/moti_shared_competition_req64_resp64_pow2" \
     --client-counts "1 2 4 8 16 32" \
     --req-bytes 64 \
     --resp-bytes 64
+
+  for resp_bytes in 8 256 1024 4096 8192; do
+    run_shared_sweep 1 \
+      "$ROOT_OUTDIR/motivation/moti_shared_respsize_c32_resp${resp_bytes}" \
+      --client-counts "32" \
+      --req-bytes 64 \
+      --resp-bytes "$resp_bytes" &
+    wait_for_onepoint_cap "$PARALLEL_JOBS"
+  done
+  wait_for_all_background
 }
 
 run_overall_phase() {
@@ -349,7 +361,7 @@ run_ring_sweep() {
   local per_jobs="$1"
   local ring_size=""
 
-  for ring_size in 16 32 64 128 256 512 1024; do
+  for ring_size in 16 32 64 128 256 512; do
     run_shared_sweep "$per_jobs" \
       "$ROOT_OUTDIR/sensitivity/ringsize_s${ring_size}" \
       --client-counts "32" \
@@ -364,11 +376,11 @@ run_size_points_phase() {
   local req_bytes=""
   local resp_bytes=""
 
-  for req_bytes in 8 64 256 1024 4096 8192; do
+  for req_bytes in 8 256 1024 4096 8192; do
     run_reqsize_point "$req_bytes" &
     wait_for_onepoint_cap "$point_cap"
   done
-  for resp_bytes in 8 64 256 1024 4096 8192; do
+  for resp_bytes in 8 256 1024 4096 8192; do
     run_respsize_point "$resp_bytes" &
     wait_for_onepoint_cap "$point_cap"
   done
@@ -391,7 +403,7 @@ run_sparse_points_phase() {
   local slow_count_per_client=""
   local slow_client_count=""
 
-  for slow_count_per_client in 8 15 30; do
+  for slow_count_per_client in 8 15; do
     for slow_client_count in 4 8 16 20 24 28; do
       run_sparse_point "$slow_client_count" "$slow_count_per_client" &
       wait_for_onepoint_cap "$point_cap"
