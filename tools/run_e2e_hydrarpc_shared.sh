@@ -38,9 +38,17 @@ Options:
   --restore-checkpoint <dir>
                            Restore from an existing boot checkpoint and start
                            directly with CPU_TYPE cores.
+  --restore-dispatch <mode>
+                           Restored workload dispatch: readfile or guest-file.
+                           Default: readfile
+  --guest-file-disk-image <path>
+                           Disk image updated in place by guest-file restore
+                           dispatch. When omitted, guest-file mode reuses
+                           --disk-image directly without copying.
   --guest-cmd <cmd>        Override the guest-side command launched after boot.
-                           Default: run_hydrarpc_shared.sh with the current
-                           microbenchmark arguments.
+                           Default boot path: run_hydrarpc_shared.sh with the
+                           current microbenchmark arguments. Guest-file restore
+                           defaults to the direct hydrarpc_shared binary.
   --result-log-name <name> Guest-visible result log filename copied into OUTDIR.
                            Default: hydrarpc_shared.result.log
   --terminal-port <N>      Host TCP port reserved for the guest COM1 listener. Default: auto-pick
@@ -57,7 +65,9 @@ Fixed resources:
 
 The shared guest binary is built on the host, injected into the disk image,
 then launched from a small readfile workload after the first m5 exit switches
-from BOOT_CPU to CPU_TYPE.
+from BOOT_CPU to CPU_TYPE. Restore-time readfile handoff can stall, so
+guest-file dispatch instead runs a guest-resident autorun wrapper from a
+reused disk image without making a new copy.
 EOF
 }
 
@@ -90,6 +100,8 @@ CXL_BRIDGE_EXTRA_LATENCY="0ns"
 NUM_CPUS=0
 SERVER_CPU=-1
 RESTORE_CHECKPOINT=""
+RESTORE_DISPATCH="readfile"
+GUEST_FILE_DISK_IMAGE=""
 GUEST_CMD_OVERRIDE=""
 RESULT_LOG_NAME="hydrarpc_shared.result.log"
 TERMINAL_PORT=0
@@ -205,6 +217,14 @@ while [[ $# -gt 0 ]]; do
       RESTORE_CHECKPOINT="$2"
       shift 2
       ;;
+    --restore-dispatch)
+      RESTORE_DISPATCH="$2"
+      shift 2
+      ;;
+    --guest-file-disk-image)
+      GUEST_FILE_DISK_IMAGE="$2"
+      shift 2
+      ;;
     --guest-cmd)
       GUEST_CMD_OVERRIDE="$2"
       shift 2
@@ -271,6 +291,20 @@ if [[ -n "$RESTORE_CHECKPOINT" ]]; then
   RESTORE_CHECKPOINT="$(cd "$RESTORE_CHECKPOINT" && pwd)"
 fi
 
+case "$RESTORE_DISPATCH" in
+  readfile|guest-file)
+    ;;
+  *)
+    echo "unsupported --restore-dispatch: $RESTORE_DISPATCH" >&2
+    exit 1
+    ;;
+esac
+
+if [[ "$RESTORE_DISPATCH" == "guest-file" && -z "$RESTORE_CHECKPOINT" ]]; then
+  echo "--restore-dispatch guest-file requires --restore-checkpoint" >&2
+  exit 1
+fi
+
 EXPECTED_TOTAL_REQUESTS=$((CLIENT_COUNT * COUNT_PER_CLIENT))
 if [[ "$SLOW_CLIENT_COUNT" -gt 0 ]]; then
   EXPECTED_TOTAL_REQUESTS=$((EXPECTED_TOTAL_REQUESTS - SLOW_CLIENT_COUNT * (COUNT_PER_CLIENT - SLOW_COUNT_PER_CLIENT)))
@@ -299,7 +333,7 @@ PY
 )"
 fi
 
-if [[ "$SKIP_IMAGE_SETUP" -eq 0 || ( -z "$RESTORE_CHECKPOINT" && "$BOOT_CPU" == "KVM" ) ]]; then
+if [[ "$SKIP_IMAGE_SETUP" -eq 0 || ( -z "$RESTORE_CHECKPOINT" && "$BOOT_CPU" == "KVM" ) || "$RESTORE_DISPATCH" == "guest-file" ]]; then
   if ! sudo -n true >/dev/null 2>&1; then
     echo "shared runner requires passwordless sudo or a live sudo ticket" >&2
     exit 1
@@ -312,33 +346,47 @@ OUTDIR="$(cd "$OUTDIR" && pwd)"
 GEM5_LOG="$OUTDIR/gem5.stdout"
 LOG_PATH="$OUTDIR/board.pc.com_1.device"
 RESULT_LOG_PATH="$OUTDIR/$RESULT_LOG_NAME"
+RUNTIME_DISK_IMAGE="$DISK_IMAGE"
+SHARED_RESTORE_AUTORUN_WRAPPER="/home/test_code/run_hydrarpc_shared_restore_autorun.sh"
 
 gem5_launcher=("$BINARY")
 if [[ -z "$RESTORE_CHECKPOINT" && "$BOOT_CPU" == "KVM" ]]; then
   gem5_launcher=(sudo -n "$BINARY")
 fi
 
-if [[ "$SKIP_IMAGE_SETUP" -eq 0 ]]; then
+if [[ -n "$GUEST_FILE_DISK_IMAGE" ]]; then
+  mkdir -p "$(dirname "$GUEST_FILE_DISK_IMAGE")"
+  GUEST_FILE_DISK_IMAGE="$(readlink -f "$GUEST_FILE_DISK_IMAGE")"
+fi
+
+if [[ "$SKIP_IMAGE_SETUP" -eq 0 && "$RESTORE_DISPATCH" != "guest-file" ]]; then
   HYDRARPC_GUEST_CFLAGS="$GUEST_CFLAGS" \
     bash tools/setup_hydrarpc_shared_disk_image.sh "$DISK_IMAGE"
 fi
 
 if [[ -n "$GUEST_CMD_OVERRIDE" ]]; then
   GUEST_CMD="$GUEST_CMD_OVERRIDE"
+  GUEST_RESTORE_CMD="$GUEST_CMD_OVERRIDE"
 else
-  GUEST_CMD="/home/test_code/run_hydrarpc_shared.sh --client-count ${CLIENT_COUNT} --count-per-client ${COUNT_PER_CLIENT} --window-size ${WINDOW_SIZE} --slot-count ${SLOT_COUNT} --req-bytes ${REQ_BYTES} --resp-bytes ${RESP_BYTES} --slow-client-count ${SLOW_CLIENT_COUNT} --slow-count-per-client ${SLOW_COUNT_PER_CLIENT} --slow-send-gap-ns ${SLOW_SEND_GAP_NS} --send-mode ${SEND_MODE} --send-gap-ns ${SEND_GAP_NS} --cxl-node ${CXL_NODE} --server-cpu ${SERVER_CPU}"
+  GUEST_COMMON_ARGS="--client-count ${CLIENT_COUNT} --count-per-client ${COUNT_PER_CLIENT} --window-size ${WINDOW_SIZE} --slot-count ${SLOT_COUNT} --req-bytes ${REQ_BYTES} --resp-bytes ${RESP_BYTES} --slow-client-count ${SLOW_CLIENT_COUNT} --slow-count-per-client ${SLOW_COUNT_PER_CLIENT} --slow-send-gap-ns ${SLOW_SEND_GAP_NS} --send-mode ${SEND_MODE} --send-gap-ns ${SEND_GAP_NS} --cxl-node ${CXL_NODE} --server-cpu ${SERVER_CPU}"
+  GUEST_CMD="/home/test_code/run_hydrarpc_shared.sh ${GUEST_COMMON_ARGS}"
+  GUEST_RESTORE_CMD="numactl -N 0 -m 0 /home/test_code/hydrarpc_shared ${GUEST_COMMON_ARGS}"
   if [[ -n "$REQ_MIN_BYTES" || -n "$REQ_MAX_BYTES" ]]; then
     GUEST_CMD+=" --req-min-bytes ${REQ_MIN_BYTES:-$REQ_BYTES} --req-max-bytes ${REQ_MAX_BYTES:-$REQ_BYTES}"
+    GUEST_RESTORE_CMD+=" --req-min-bytes ${REQ_MIN_BYTES:-$REQ_BYTES} --req-max-bytes ${REQ_MAX_BYTES:-$REQ_BYTES}"
   fi
   if [[ -n "$RESP_MIN_BYTES" || -n "$RESP_MAX_BYTES" ]]; then
     GUEST_CMD+=" --resp-min-bytes ${RESP_MIN_BYTES:-$RESP_BYTES} --resp-max-bytes ${RESP_MAX_BYTES:-$RESP_BYTES}"
+    GUEST_RESTORE_CMD+=" --resp-min-bytes ${RESP_MIN_BYTES:-$RESP_BYTES} --resp-max-bytes ${RESP_MAX_BYTES:-$RESP_BYTES}"
   fi
   if [[ "$TRACE_REQUESTS" -eq 1 ]]; then
     GUEST_CMD+=" --trace-requests"
+    GUEST_RESTORE_CMD+=" --trace-requests"
   fi
 fi
 WORKLOAD_FILE="$OUTDIR/hydrarpc_shared.runscript"
 RESTORE_WORKLOAD_FILE="$OUTDIR/hydrarpc_shared.restore.runscript"
+RESTORE_AUTORUN_CMD_FILE="$OUTDIR/hydrarpc_shared.restore.autorun.sh"
 
 {
   printf "#!/bin/sh\n"
@@ -392,6 +440,46 @@ RESTORE_WORKLOAD_FILE="$OUTDIR/hydrarpc_shared.restore.runscript"
   printf "/sbin/m5 exit\n"
 } > "$RESTORE_WORKLOAD_FILE"
 
+{
+  printf "#!/bin/sh\n"
+  printf "set -eu\n"
+  printf "printf 'RUNSCRIPT restore_guest_cmd_start\\n'\n"
+  printf "sync\n"
+  printf "echo 3 > /proc/sys/vm/drop_caches || true\n"
+  printf "set +e\n"
+  printf "%s\n" "$GUEST_RESTORE_CMD"
+  printf "rc=\$?\n"
+  printf "printf 'guest_command_rc=%%s\\\\n' \"\$rc\"\n"
+  printf "printf 'RUNSCRIPT restore_second_m5_exit rc=%%s\\n' \"\$rc\"\n"
+  printf "/sbin/m5 exit\n"
+} > "$RESTORE_AUTORUN_CMD_FILE"
+
+chmod 755 "$WORKLOAD_FILE" "$RESTORE_WORKLOAD_FILE" "$RESTORE_AUTORUN_CMD_FILE"
+
+prepare_guest_file_restore_image() {
+  local image_copy="$DISK_IMAGE"
+
+  if [[ -n "$GUEST_FILE_DISK_IMAGE" ]]; then
+    image_copy="$GUEST_FILE_DISK_IMAGE"
+  fi
+
+  if [[ "$SKIP_IMAGE_SETUP" -eq 0 ]]; then
+    HYDRARPC_GUEST_CFLAGS="$GUEST_CFLAGS" \
+      bash tools/setup_hydrarpc_shared_disk_image.sh "$image_copy"
+  fi
+
+  env HYDRARPC_RESTORE_AUTORUN_GUEST_WRAPPER="$SHARED_RESTORE_AUTORUN_WRAPPER" \
+    bash tools/install_hydrarpc_restore_autorun_in_image.sh \
+      "$image_copy" \
+      "$RESTORE_AUTORUN_CMD_FILE"
+
+  RUNTIME_DISK_IMAGE="$image_copy"
+}
+
+if [[ "$RESTORE_DISPATCH" == "guest-file" ]]; then
+  prepare_guest_file_restore_image
+fi
+
 gem5_args=(
   -d "$OUTDIR"
 )
@@ -406,16 +494,23 @@ gem5_args+=(
   --cpu_type "$CPU_TYPE"
   --num_cpus "$NUM_CPUS"
   --kernel "$KERNEL"
-  --disk-image "$DISK_IMAGE"
+  --disk-image "$RUNTIME_DISK_IMAGE"
   --terminal-port "$TERMINAL_PORT"
   --cxl-bridge-extra-latency "$CXL_BRIDGE_EXTRA_LATENCY"
 )
 
 if [[ -n "$RESTORE_CHECKPOINT" ]]; then
-  gem5_args+=(
-    --restore-checkpoint "$RESTORE_CHECKPOINT"
-    --workload-file "$RESTORE_WORKLOAD_FILE"
-  )
+  if [[ "$RESTORE_DISPATCH" == "guest-file" ]]; then
+    gem5_args+=(
+      --restore-checkpoint "$RESTORE_CHECKPOINT"
+      --disable-workload
+    )
+  else
+    gem5_args+=(
+      --restore-checkpoint "$RESTORE_CHECKPOINT"
+      --workload-file "$RESTORE_WORKLOAD_FILE"
+    )
+  fi
 else
   gem5_args+=(
     --boot_cpu "$BOOT_CPU"

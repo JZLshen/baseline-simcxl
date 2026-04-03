@@ -32,6 +32,7 @@
 
 #define CACHELINE_SIZE 64u
 #define MAX_TOURNAMENT_DEPTH 64u
+#define REMOTE_SPIN_BACKOFF_MAX_SHIFT 10u
 #define DEFAULT_REQUEST_PAYLOAD_SIZE 64u
 #define DEFAULT_RESPONSE_PAYLOAD_SIZE 64u
 
@@ -70,19 +71,20 @@ struct PetersonNode {
 
 struct RequestPublishState {
     volatile uint64_t produce_seq;
-    volatile uint64_t data_tail;
-    uint8_t padding[CACHELINE_SIZE - (2 * sizeof(uint64_t))];
+    uint8_t padding[CACHELINE_SIZE - sizeof(uint64_t)];
 } __attribute__((aligned(CACHELINE_SIZE)));
 
-struct Connection {
+struct SharedRequestState {
     volatile struct NotifyQueueLine *request_queue;
+    struct PetersonNode *request_lock_nodes;
+    volatile struct RequestPublishState *request_publish_state;
+    uint64_t lock_leaf_count;
+};
+
+struct Connection {
     volatile struct NotifyQueueLine *response_queue;
     uint8_t *request_data_area;
     uint8_t *response_data_area;
-    struct PetersonNode *request_lock_nodes;
-    volatile struct RequestPublishState *request_publish_state;
-    volatile uint64_t *response_consume_seq;
-    uint64_t lock_leaf_count;
     size_t request_data_size;
     size_t response_data_size;
 };
@@ -113,6 +115,7 @@ enum SharedFailCode {
     FAIL_FORK_CLIENT = 9,
     FAIL_WAIT_CHILD = 10,
     FAIL_TRACE_STALL = 11,
+    FAIL_CLIENT_REQ_BUILD = 12,
 };
 
 struct RequestTimingData {
@@ -909,7 +912,12 @@ response_len_for_seq(const struct PayloadLengthPlan *plan,
 static inline uint64_t
 payload_length_plan_stride(const struct PayloadLengthPlan *plan)
 {
-    return plan->max_size;
+    /*
+     * Non-coherent CXL visibility is cacheline-granular. Keep each logical
+     * payload record on its own cacheline to avoid false sharing between
+     * adjacent requests/responses.
+     */
+    return payload_span_u64(plan->max_size);
 }
 
 static inline int
@@ -967,11 +975,36 @@ next_rand(uint64_t *state)
     return *state;
 }
 
+static inline void
+remote_spin_backoff(uint32_t *state)
+{
+    uint32_t shift = 0;
+    uint32_t pause_count = 1;
+
+    if (state != NULL)
+        shift = (*state < REMOTE_SPIN_BACKOFF_MAX_SHIFT)
+                    ? *state
+                    : REMOTE_SPIN_BACKOFF_MAX_SHIFT;
+    pause_count <<= shift;
+    for (uint32_t i = 0; i < pause_count; i++)
+        _mm_pause();
+    if (state != NULL && *state < REMOTE_SPIN_BACKOFF_MAX_SHIFT)
+        (*state)++;
+}
+
+static inline void
+remote_spin_backoff_reset(uint32_t *state)
+{
+    if (state != NULL)
+        *state = 0;
+}
+
 static void
 wait_for_start(volatile uint64_t *start_flag)
 {
     while (__atomic_load_n((const uint64_t *)start_flag, __ATOMIC_ACQUIRE) ==
            0) {
+        _mm_pause();
     }
 }
 
@@ -1241,6 +1274,12 @@ request_shadow_at(uint8_t *buffer, uint64_t seq, uint64_t request_payload_size)
     return buffer + (size_t)(seq * request_payload_size);
 }
 
+static inline uint64_t
+payload_offset_for_seq(uint64_t seq, uint64_t payload_stride)
+{
+    return seq * payload_stride;
+}
+
 static void
 fill_random_payload_bytes(uint8_t *dst, uint64_t payload_len, uint64_t *rng_state)
 {
@@ -1292,12 +1331,11 @@ response_matches_request(const uint8_t *response_bytes,
 
 #if HYDRARPC_APP_VARIANT
 static int
-build_client_request_payload(const struct AppRuntime *app_runtime,
-                             uint64_t client_id,
-                             uint64_t req_id,
-                             uint8_t *remote_dst,
-                             uint8_t *request_shadow,
-                             uint64_t request_payload_size)
+prepare_client_request_payload(const struct AppRuntime *app_runtime,
+                               uint64_t client_id,
+                               uint64_t req_id,
+                               uint8_t *request_shadow,
+                               uint64_t request_payload_size)
 {
     const hydrarpc_app_operation_t *op =
         app_operation_for_seq(app_runtime, client_id, req_id);
@@ -1314,7 +1352,6 @@ build_client_request_payload(const struct AppRuntime *app_runtime,
     if (built_len != request_payload_size)
         return -1;
 
-    store_payload_remote(remote_dst, request_shadow, request_payload_size);
     return 0;
 }
 
@@ -1367,13 +1404,14 @@ client_response_matches(const struct AppRuntime *app_runtime,
 }
 #else
 static int
-build_client_request_payload(uint8_t *remote_dst,
-                             uint8_t *request_shadow,
-                             uint64_t request_payload_size,
-                             uint64_t *rng_state)
+prepare_client_request_payload(uint8_t *request_shadow,
+                               uint64_t request_payload_size,
+                               uint64_t *rng_state)
 {
+    if (request_shadow == NULL || rng_state == NULL)
+        return -1;
+
     fill_random_payload_bytes(request_shadow, request_payload_size, rng_state);
-    store_payload_remote(remote_dst, request_shadow, request_payload_size);
     return 0;
 }
 
@@ -1486,10 +1524,15 @@ tournament_lock_acquire(struct PetersonNode *nodes,
 
         peterson_publish_remote(node, side);
 
-        for (;;) {
-            peterson_load_remote(node, other_side, &other_flag, &victim);
-            if (other_flag == 0 || victim != side)
-                break;
+        {
+            uint32_t backoff_state = 0;
+
+            for (;;) {
+                peterson_load_remote(node, other_side, &other_flag, &victim);
+                if (other_flag == 0 || victim != side)
+                    break;
+                remote_spin_backoff(&backoff_state);
+            }
         }
 
         idx = parent;
@@ -1515,7 +1558,8 @@ tournament_lock_release(struct PetersonNode *nodes,
 }
 
 static int
-run_server_shared(struct Connection *connection,
+run_server_shared(const struct SharedRequestState *shared_state,
+                  struct Connection *connections,
                   uint64_t client_count,
                   uint64_t slot_count,
                   uint64_t request_count,
@@ -1542,13 +1586,13 @@ run_server_shared(struct Connection *connection,
     uint64_t last_response_tail_trace_seq = UINT64_MAX;
     uint64_t last_response_tail_trace_notify = UINT64_MAX;
     uint64_t request_consume_seq = 0;
-    uint64_t response_produce_seq = 0;
-    uint64_t response_data_tail = 0;
     uint64_t completed_total = 0;
     uint64_t *next_req_seq_per_client =
         calloc((size_t)client_count, sizeof(*next_req_seq_per_client));
     uint8_t *request_payload_local = malloc((size_t)request_payload_stride);
     uint8_t *response_staging = malloc((size_t)response_payload_stride);
+    uint32_t request_head_backoff = 0;
+    uint32_t response_publish_backoff = 0;
 
     if (next_req_seq_per_client == NULL ||
         request_payload_local == NULL ||
@@ -1580,7 +1624,7 @@ run_server_shared(struct Connection *connection,
            !control_has_error(control)) {
         uint64_t request_slot = request_consume_seq % slot_count;
         volatile struct NotifyQueueLine *request_queue_line =
-            notify_queue_line_at(connection->request_queue, request_slot);
+            notify_queue_line_at(shared_state->request_queue, request_slot);
         uint64_t request_notify = load_notify_word_remote(request_queue_line);
 
         if (request_consume_seq != last_request_head_trace_seq ||
@@ -1616,11 +1660,15 @@ run_server_shared(struct Connection *connection,
             last_request_head_trace_notify = request_notify;
         }
 
-        if (!notify_valid(request_notify))
+        if (!notify_valid(request_notify)) {
+            remote_spin_backoff(&request_head_backoff);
             continue;
+        }
+        remote_spin_backoff_reset(&request_head_backoff);
 
         {
             uint64_t request_client_id = notify_client_id(request_notify);
+            struct Connection *connection = &connections[request_client_id];
             uint64_t request_req_id = next_req_seq_per_client[request_client_id];
             uint64_t client_request_count = client_request_limit(
                 request_client_id,
@@ -1630,7 +1678,8 @@ run_server_shared(struct Connection *connection,
             );
             uint64_t request_len = notify_len(request_notify);
             uint64_t request_offset = notify_offset(request_notify);
-            uint64_t response_offset = response_data_tail;
+            uint64_t response_offset =
+                payload_offset_for_seq(request_req_id, response_payload_stride);
             uint64_t response_notify = 0;
             uint64_t response_slot = 0;
             uint64_t expected_request_len =
@@ -1748,15 +1797,13 @@ run_server_shared(struct Connection *connection,
                                      0);
                 break;
             }
-            response_data_tail += payload_span_u64(expected_response_len);
-
             response_notify =
                 notify_make(response_offset,
                             request_client_id,
                             expected_response_len);
 
             for (;;) {
-                response_slot = response_produce_seq % slot_count;
+                response_slot = request_req_id % slot_count;
                 {
                     volatile struct NotifyQueueLine *response_queue_line =
                         notify_queue_line_at(connection->response_queue,
@@ -1767,14 +1814,14 @@ run_server_shared(struct Connection *connection,
                                             ? "srv_resp_tail_busy"
                                             : "srv_resp_tail_free";
 
-                    if (response_produce_seq != last_response_tail_trace_seq ||
+                    if (request_req_id != last_response_tail_trace_seq ||
                         response_slot_notify != last_response_tail_trace_notify) {
                         debug_queue_state_event("server",
                                                 0,
                                                 request_client_id,
                                                 request_req_id,
                                                 stage,
-                                                response_produce_seq,
+                                                request_req_id,
                                                 response_slot,
                                                 response_offset,
                                                 expected_response_len,
@@ -1782,13 +1829,13 @@ run_server_shared(struct Connection *connection,
                                                 completed_total,
                                                 total_request_target,
                                                 NULL);
-                        last_response_tail_trace_seq = response_produce_seq;
+                        last_response_tail_trace_seq = request_req_id;
                         last_response_tail_trace_notify = response_slot_notify;
                     }
 
                     if (!notify_valid(response_slot_notify)) {
+                        remote_spin_backoff_reset(&response_publish_backoff);
                         write_notify_word_remote(response_queue_line, response_notify);
-                        response_produce_seq++;
                         server_resp_done_ts = m5_rpns_ns();
                         debug_request_event("server",
                                             0,
@@ -1812,6 +1859,7 @@ run_server_shared(struct Connection *connection,
 
                 if (control_has_error(control))
                     break;
+                remote_spin_backoff(&response_publish_backoff);
             }
             if (control_has_error(control))
                 break;
@@ -1836,7 +1884,8 @@ run_server_shared(struct Connection *connection,
 }
 
 static int
-run_client_shared(struct Connection *connection,
+run_client_shared(const struct SharedRequestState *shared_state,
+                  struct Connection *connection,
                   uint64_t client_count,
                   uint64_t client_id,
                   uint64_t window_size,
@@ -1864,7 +1913,9 @@ run_client_shared(struct Connection *connection,
                                                          request_count,
                                                          slow_client_count,
                                                          slow_request_count);
+#if !HYDRARPC_APP_VARIANT
     uint64_t rng_state = client_id + 1;
+#endif
     uint64_t sent = 0;
     uint64_t completed = 0;
     uint64_t pending_start = 0;
@@ -1880,14 +1931,18 @@ run_client_shared(struct Connection *connection,
     uint8_t *request_shadow_local = calloc((size_t)client_request_count,
                                            (size_t)request_payload_stride);
     uint8_t *response_local = malloc((size_t)response_payload_stride);
+    uint64_t pending_request_payload_len = 0;
+    uint64_t pending_request_offset = 0;
     uint64_t last_response_trace_seq = UINT64_MAX;
     uint64_t last_response_trace_notify = UINT64_MAX;
     uint64_t last_request_head_trace_seq = UINT64_MAX;
-    uint64_t last_request_head_trace_tail = UINT64_MAX;
     uint64_t last_request_head_trace_notify = UINT64_MAX;
     int pending_valid = 0;
+    int pending_payload_staged = 0;
     uint64_t request_lock_path_nodes[MAX_TOURNAMENT_DEPTH];
     uint8_t request_lock_path_sides[MAX_TOURNAMENT_DEPTH];
+    uint32_t request_publish_backoff = 0;
+    uint32_t response_head_backoff = 0;
 
     if (request_shadow_local == NULL || response_local == NULL) {
         fprintf(stderr,
@@ -1944,33 +1999,70 @@ run_client_shared(struct Connection *connection,
 #if HYDRARPC_APP_VARIANT
                     app_runtime,
 #endif
-                    client_id,
-                    sent,
-                    client_request_count);
+                        client_id,
+                        sent,
+                        client_request_count);
+            pending_request_offset =
+                payload_offset_for_seq(sent, request_payload_stride);
             uint8_t *request_shadow =
                 request_shadow_at(request_shadow_local,
                                   sent,
                                   request_payload_stride);
 
             pending_start = m5_rpns_ns();
+            if (
 #if HYDRARPC_APP_VARIANT
-            (void)request_shadow;
-            (void)request_payload_len;
+                prepare_client_request_payload(app_runtime,
+                                               client_id,
+                                               sent,
+                                               request_shadow,
+                                               request_payload_len) != 0
 #else
-            fill_random_payload_bytes(request_shadow,
-                                      request_payload_len,
-                                      &rng_state);
+                prepare_client_request_payload(request_shadow,
+                                               request_payload_len,
+                                               &rng_state) != 0
 #endif
+            ) {
+                record_control_error(control,
+                                     FAIL_CLIENT_REQ_BUILD,
+                                     client_id,
+                                     sent,
+                                     request_payload_len,
+                                     0,
+                                     0,
+                                     0);
+                free(request_shadow_local);
+                free(response_local);
+                return 1;
+            }
+            pending_request_payload_len = request_payload_len;
             pending_valid = 1;
+            pending_payload_staged = 0;
             if (!first_pending_marked) {
                 debug_mark("client", client_id, "first_pending", sent, pending_start);
                 first_pending_marked = 1;
             }
         }
 
+        if (pending_valid && !pending_payload_staged && !control_has_error(control)) {
+            uint8_t *request_shadow =
+                request_shadow_at(request_shadow_local,
+                                  sent,
+                                  request_payload_stride);
+
+            store_payload_remote(
+                payload_at_offset(connection->request_data_area,
+                                  pending_request_offset),
+                request_shadow,
+                pending_request_payload_len
+            );
+            pending_payload_staged = 1;
+        }
+
         if (pending_valid && !control_has_error(control)) {
-            uint64_t lock_depth = tournament_lock_acquire(connection->request_lock_nodes,
-                                                          connection->lock_leaf_count,
+            int request_slot_busy = 0;
+            uint64_t lock_depth = tournament_lock_acquire(shared_state->request_lock_nodes,
+                                                          shared_state->lock_leaf_count,
                                                           client_id,
                                                           request_lock_path_nodes,
                                                           request_lock_path_sides);
@@ -1986,28 +2078,18 @@ run_client_shared(struct Connection *connection,
                 uint64_t request_slot = request_seq % slot_count;
                 uint64_t request_notify = 0;
                 volatile struct NotifyQueueLine *request_queue_line =
-                    notify_queue_line_at(connection->request_queue, request_slot);
+                    notify_queue_line_at(shared_state->request_queue, request_slot);
 
                 load_request_publish_state_remote(&publish_state,
-                                                  connection->request_publish_state);
+                                                  shared_state->request_publish_state);
                 request_seq = publish_state.produce_seq;
                 request_slot = request_seq % slot_count;
                 request_queue_line =
-                    notify_queue_line_at(connection->request_queue, request_slot);
+                    notify_queue_line_at(shared_state->request_queue, request_slot);
                 request_notify = load_notify_word_remote(request_queue_line);
 
                 if (request_seq != last_request_head_trace_seq ||
-                    publish_state.data_tail != last_request_head_trace_tail ||
                     request_notify != last_request_head_trace_notify) {
-                    uint64_t request_payload_len =
-                        request_len_for_seq(
-                            request_length_plan,
-#if HYDRARPC_APP_VARIANT
-                            app_runtime,
-#endif
-                            client_id,
-                            sent,
-                            client_request_count);
                     struct TraceContext context = {
                         .sent = sent,
                         .completed = completed,
@@ -2027,33 +2109,18 @@ run_client_shared(struct Connection *connection,
                                             stage,
                                             request_seq,
                                             request_slot,
-                                            publish_state.data_tail,
-                                            request_payload_len,
+                                            pending_request_offset,
+                                            pending_request_payload_len,
                                             request_notify,
                                             0,
                                             0,
                                             &context);
                     last_request_head_trace_seq = request_seq;
-                    last_request_head_trace_tail = publish_state.data_tail;
                     last_request_head_trace_notify = request_notify;
                 }
 
                 if (!notify_valid(request_notify)) {
-                    uint64_t request_offset = publish_state.data_tail;
-                    uint64_t request_payload_len =
-                        request_len_for_seq(
-                            request_length_plan,
-#if HYDRARPC_APP_VARIANT
-                            app_runtime,
-#endif
-                            client_id,
-                            sent,
-                            client_request_count);
                     size_t index = base + sent;
-                    uint8_t *request_shadow =
-                        request_shadow_at(request_shadow_local,
-                                          sent,
-                                          request_payload_stride);
                     struct TraceContext context = {
                         .sent = sent,
                         .completed = completed,
@@ -2066,57 +2133,18 @@ run_client_shared(struct Connection *connection,
                     store_shared_u64(&timing->client_req_publish_seq[index],
                                      request_seq);
                     store_shared_u64(&timing->client_req_publish_offset[index],
-                                     request_offset);
+                                     pending_request_offset);
                     store_shared_u64(&timing->client_req_start_ts_ns[index],
                                      pending_start);
-                    if (
-#if HYDRARPC_APP_VARIANT
-                        build_client_request_payload(
-                            app_runtime,
-                            client_id,
-                            sent,
-                            payload_at_offset(connection->request_data_area,
-                                              request_offset),
-                            request_shadow,
-                            request_payload_len
-                        ) != 0
-#else
-                        build_client_request_payload(
-                            payload_at_offset(connection->request_data_area,
-                                              request_offset),
-                            request_shadow,
-                            request_payload_len,
-                            &rng_state
-                        ) != 0
-#endif
-                    ) {
-                        record_control_error(control,
-                                             FAIL_CLIENT_RESP_MISMATCH,
-                                             client_id,
-                                             sent,
-                                             request_payload_len,
-                                             0,
-                                             0,
-                                             0);
-                        tournament_lock_release(connection->request_lock_nodes,
-                                                request_lock_path_nodes,
-                                                request_lock_path_sides,
-                                                lock_depth);
-                        free(request_shadow_local);
-                        free(response_local);
-                        return 1;
-                    }
                     write_notify_word_remote(
                         request_queue_line,
-                        notify_make(request_offset,
+                        notify_make(pending_request_offset,
                                     client_id,
-                                    request_payload_len)
+                                    pending_request_payload_len)
                     );
-                    publish_state.data_tail =
-                        request_offset + payload_span_u64(request_payload_len);
                     publish_state.produce_seq = request_seq + 1;
                     store_request_publish_state_remote(
-                        connection->request_publish_state,
+                        shared_state->request_publish_state,
                         &publish_state
                     );
                     debug_request_state_event("client",
@@ -2126,8 +2154,8 @@ run_client_shared(struct Connection *connection,
                                               "publish",
                                               request_seq,
                                               request_slot,
-                                              request_offset,
-                                              request_payload_len,
+                                              pending_request_offset,
+                                              pending_request_payload_len,
                                               0,
                                               0,
                                               0,
@@ -2138,23 +2166,32 @@ run_client_shared(struct Connection *connection,
                                    client_id,
                                    "first_publish",
                                    request_seq,
-                                   request_offset);
+                                   pending_request_offset);
                         first_publish_marked = 1;
                     }
 
                     pending_valid = 0;
+                    pending_payload_staged = 0;
+                    pending_request_payload_len = 0;
+                    pending_request_offset = 0;
                     sent++;
+                    remote_spin_backoff_reset(&request_publish_backoff);
+                } else {
+                    request_slot_busy = 1;
                 }
             }
 
-            tournament_lock_release(connection->request_lock_nodes,
+            tournament_lock_release(shared_state->request_lock_nodes,
                                     request_lock_path_nodes,
                                     request_lock_path_sides,
                                     lock_depth);
+            if (request_slot_busy)
+                remote_spin_backoff(&request_publish_backoff);
         }
 
         if (completed < sent && !control_has_error(control)) {
-            uint64_t response_seq = read_remote_u64(connection->response_consume_seq);
+            int response_made_progress = 0;
+            uint64_t response_seq = completed;
             uint64_t response_slot = response_seq % slot_count;
             volatile struct NotifyQueueLine *response_queue_line =
                 notify_queue_line_at(connection->response_queue, response_slot);
@@ -2171,7 +2208,9 @@ run_client_shared(struct Connection *connection,
 
             if (response_seq != last_response_trace_seq ||
                 response_notify != last_response_trace_notify) {
-                const char *stage = "resp_head_invalid";
+                const char *stage = notify_valid(response_notify)
+                                        ? "resp_head_self"
+                                        : "resp_head_invalid";
                 struct TraceContext context = {
                     .sent = sent,
                     .completed = completed,
@@ -2180,13 +2219,6 @@ run_client_shared(struct Connection *connection,
                     .raw_word = response_notify,
                     .pending_valid = (uint8_t)pending_valid,
                 };
-
-                if (notify_valid(response_notify)) {
-                    if (response_owner == client_id)
-                        stage = "resp_head_self";
-                    else
-                        stage = "resp_head_other";
-                }
 
                 debug_response_head_state_event(client_id,
                                                 completed,
@@ -2201,8 +2233,7 @@ run_client_shared(struct Connection *connection,
                 last_response_trace_notify = response_notify;
             }
 
-            if (notify_valid(response_notify) &&
-                response_owner == client_id) {
+            if (notify_valid(response_notify)) {
                 struct TraceContext context = {
                     .sent = sent,
                     .completed = completed,
@@ -2211,56 +2242,26 @@ run_client_shared(struct Connection *connection,
                     .raw_word = response_notify,
                     .pending_valid = (uint8_t)pending_valid,
                 };
-                uint64_t response_seq_reread =
-                    read_remote_u64(connection->response_consume_seq);
-
-                if (response_seq_reread != response_seq) {
-                    debug_response_head_state_event(client_id,
-                                                    completed,
-                                                    "resp_head_raced",
-                                                    response_seq,
-                                                    response_slot,
-                                                    response_owner,
-                                                    response_offset,
-                                                    response_len,
-                                                    &context);
-                    continue;
-                }
-
-                debug_request_state_event("client",
-                                          client_id,
-                                          client_id,
-                                          completed,
-                                          "resp_seen",
-                                          response_seq,
-                                          response_slot,
-                                          response_offset,
-                                          response_len,
-                                          0,
-                                          0,
-                                          0,
-                                          &context);
-
-                if (!first_resp_marked) {
-                    debug_mark("client",
-                               client_id,
-                               "first_resp_seen",
-                               response_seq,
-                               response_offset);
-                    first_resp_marked = 1;
-                }
-
-                {
-                    uint64_t expected_response_len =
-                        response_len_for_seq(
-                            response_length_plan,
+                uint64_t expected_response_len =
+                    response_len_for_seq(
+                        response_length_plan,
 #if HYDRARPC_APP_VARIANT
-                            app_runtime,
+                        app_runtime,
 #endif
-                            client_id,
-                            completed,
-                            client_request_count);
-                    if (response_len != expected_response_len) {
+                        client_id,
+                        completed,
+                        client_request_count);
+
+                if (response_owner != client_id) {
+                    record_control_error(control,
+                                         FAIL_CLIENT_RESP_MISMATCH,
+                                         client_id,
+                                         completed,
+                                         response_owner,
+                                         response_seq,
+                                         response_offset,
+                                         response_len);
+                } else if (response_len != expected_response_len) {
                     fprintf(stderr,
                             "client %" PRIu64 " observed unexpected response length\n",
                             client_id);
@@ -2272,62 +2273,83 @@ run_client_shared(struct Connection *connection,
                                          expected_response_len,
                                          0,
                                          0);
-                    } else {
-                        uint64_t expected_request_len =
-                            request_len_for_seq(
-                                request_length_plan,
+                } else {
+                    uint64_t expected_request_len =
+                        request_len_for_seq(
+                            request_length_plan,
 #if HYDRARPC_APP_VARIANT
-                                app_runtime,
+                            app_runtime,
 #endif
-                                client_id,
-                                completed,
-                                client_request_count);
-                        uint8_t *request_shadow =
-                            request_shadow_at(request_shadow_local,
+                            client_id,
+                            completed,
+                            client_request_count);
+                    uint8_t *request_shadow =
+                        request_shadow_at(request_shadow_local,
+                                          completed,
+                                          request_payload_stride);
+                    uint64_t expected_head = 0;
+                    uint64_t observed_head = 0;
+                    uint64_t end = 0;
+                    int fail = 0;
+
+                    debug_request_state_event("client",
+                                              client_id,
+                                              client_id,
                                               completed,
-                                              request_payload_stride);
-                        uint64_t expected_head = 0;
-                        uint64_t observed_head = 0;
-                        uint64_t end = 0;
-                        int fail = 0;
+                                              "resp_seen",
+                                              response_seq,
+                                              response_slot,
+                                              response_offset,
+                                              response_len,
+                                              0,
+                                              0,
+                                              0,
+                                              &context);
+
+                    if (!first_resp_marked) {
+                        debug_mark("client",
+                                   client_id,
+                                   "first_resp_seen",
+                                   response_seq,
+                                   response_offset);
+                        first_resp_marked = 1;
+                    }
 
                     clear_notify_word_remote(response_queue_line);
-                    write_remote_u64(connection->response_consume_seq,
-                                     response_seq + 1);
-
                     load_payload_remote(response_local,
                                         payload_at_offset(connection->response_data_area,
                                                           response_offset),
                                         response_len);
-                        fail =
+                    fail =
 #if HYDRARPC_APP_VARIANT
-                            !client_response_matches(app_runtime,
-                                                     client_id,
-                                                     completed,
-                                                     response_local,
-                                                     response_len,
-                                                     request_shadow,
-                                                     expected_request_len);
+                        !client_response_matches(app_runtime,
+                                                 client_id,
+                                                 completed,
+                                                 response_local,
+                                                 response_len,
+                                                 request_shadow,
+                                                 expected_request_len);
 #else
-                            !client_response_matches(client_id,
-                                                     completed,
-                                                     response_local,
-                                                     response_len,
-                                                     request_shadow,
-                                                     expected_request_len);
+                        !client_response_matches(client_id,
+                                                 completed,
+                                                 response_local,
+                                                 response_len,
+                                                 request_shadow,
+                                                 expected_request_len);
 #endif
-                        memcpy(&expected_head,
-                               request_shadow,
-                               sizeof(expected_head));
-                        memcpy(&observed_head,
-                               response_local,
-                               sizeof(observed_head));
-                        end = m5_rpns_ns();
+                    memcpy(&expected_head,
+                           request_shadow,
+                           sizeof(expected_head));
+                    memcpy(&observed_head,
+                           response_local,
+                           sizeof(observed_head));
+                    end = m5_rpns_ns();
 
                     store_shared_u64(
                         &timing->client_resp_done_ts_ns[base + completed],
                         end
                     );
+                    response_made_progress = 1;
 
                     if (fail) {
                         debug_request_state_event("client",
@@ -2376,11 +2398,14 @@ run_client_shared(struct Connection *connection,
                                                   &context);
                         completed++;
                     }
-                    }
                 }
-            }
-        }
 
+                if (response_made_progress)
+                    remote_spin_backoff_reset(&response_head_backoff);
+            }
+            if (!response_made_progress)
+                remote_spin_backoff(&response_head_backoff);
+        }
     }
 
     free(request_shadow_local);
@@ -2721,7 +2746,6 @@ main(int argc, char **argv)
     size_t response_data_size = 0;
     size_t request_lock_nodes_size = 0;
     size_t request_publish_state_size = 0;
-    size_t response_consume_seq_size = 0;
     size_t trace_buffer_size = 0;
     uint64_t trace_capacity = 0;
     struct PayloadLengthPlan request_length_plan = {0};
@@ -2743,7 +2767,8 @@ main(int argc, char **argv)
     int app_value_size_overridden = 0;
     int app_variable_layout = 0;
 #endif
-    struct Connection connection = {0};
+    struct SharedRequestState shared_request = {0};
+    struct Connection *connections = NULL;
     struct SharedControl *control = NULL;
     struct RequestTimingData timing = {0};
     struct TraceBuffer *trace_buffer = NULL;
@@ -2857,15 +2882,17 @@ main(int argc, char **argv)
                    "[--send-mode greedy|uniform|staggered|uneven] "
                    "[--send-gap-ns N] [--server-cpu N] "
                    "[--trace-requests]\n"
-                   "  slot-count is shared request/response notify-ring depth; "
-                   "default is client-count * min(window-size, count-per-client)\n"
+                   "  slot-count is the shared request-ring depth and the per-client "
+                   "response-ring depth; default is client-count * min(window-size, "
+                   "count-per-client)\n"
                    "  req-bytes/resp-bytes set the request/response payload sizes; "
                    "defaults are %" PRIu64 "/%" PRIu64 " bytes\n"
                    "  req/resp-min-bytes and req/resp-max-bytes optionally enable "
                    "deterministic per-request uniform bins across each client's "
                    "request sequence\n"
-                   "  payload areas are shared append-only regions; responses "
-                   "copy the request prefix and zero-fill any extra bytes\n"
+                   "  each client owns a dedicated request-data region, "
+                   "response-data region, and response queue in CXL memory; "
+                   "only the request queue is globally shared\n"
                    "  the first RPC from each client stays fully serialized "
                    "before the steady-state window opens\n"
                    "  slow-client-count marks the first N client ids as slow; "
@@ -3109,65 +3136,72 @@ main(int argc, char **argv)
         goto cleanup;
     }
 
-    request_span = payload_span_u64(payload_length_plan_stride(&request_length_plan));
-    response_span = payload_span_u64(payload_length_plan_stride(&response_length_plan));
+    request_span = payload_length_plan_stride(&request_length_plan);
+    response_span = payload_length_plan_stride(&response_length_plan);
     total_requests = client_count * request_count;
     total_request_target = total_request_limit(client_count,
                                                request_count,
                                                slow_client_count,
                                                slow_request_count);
-    request_queue_size = sizeof(*connection.request_queue) * slot_count;
-    response_queue_size = sizeof(*connection.response_queue) * slot_count;
-    request_data_size = (size_t)(total_request_target * request_span);
-    response_data_size = (size_t)(total_request_target * response_span);
-    request_publish_state_size = sizeof(*connection.request_publish_state);
-    response_consume_seq_size = sizeof(*connection.response_consume_seq);
+    request_queue_size = sizeof(*shared_request.request_queue) * slot_count;
+    response_queue_size = sizeof(struct NotifyQueueLine) * slot_count;
+    request_data_size = (size_t)(request_count * request_span);
+    response_data_size = (size_t)(request_count * response_span);
+    request_publish_state_size = sizeof(*shared_request.request_publish_state);
 
     if ((uint64_t)request_data_size > NOTIFY_OFFSET_MASK + 1u ||
         (uint64_t)response_data_size > NOTIFY_OFFSET_MASK + 1u) {
         fprintf(stderr,
-                "shared payload area exceeds %u-bit notify offset range\n",
+                "per-client payload area exceeds %u-bit notify offset range\n",
                 (unsigned)NOTIFY_OFFSET_BITS);
         rc = 2;
         goto cleanup;
     }
 
-    connection.lock_leaf_count =
+    shared_request.lock_leaf_count =
         client_count > 1 ? next_pow2_u64(client_count) : 0;
-    connection.request_data_size = request_data_size;
-    connection.response_data_size = response_data_size;
     request_lock_nodes_size =
-        sizeof(*connection.request_lock_nodes) *
-        (connection.lock_leaf_count > 0
-             ? (connection.lock_leaf_count - 1)
+        sizeof(*shared_request.request_lock_nodes) *
+        (shared_request.lock_leaf_count > 0
+             ? (shared_request.lock_leaf_count - 1)
              : 0);
 
-    connection.request_queue = alloc_shared_cxl(request_queue_size, cxl_node);
-    connection.response_queue = alloc_shared_cxl(response_queue_size, cxl_node);
-    connection.request_data_area = alloc_shared_cxl(request_data_size, cxl_node);
-    connection.response_data_area = alloc_shared_cxl(response_data_size, cxl_node);
+    shared_request.request_queue = alloc_shared_cxl(request_queue_size, cxl_node);
     if (request_lock_nodes_size > 0) {
-        connection.request_lock_nodes =
+        shared_request.request_lock_nodes =
             alloc_shared_cxl(request_lock_nodes_size, cxl_node);
     }
-    connection.request_publish_state =
+    shared_request.request_publish_state =
         alloc_shared_cxl(request_publish_state_size, cxl_node);
-    connection.response_consume_seq =
-        alloc_shared_cxl(response_consume_seq_size, cxl_node);
+    connections = calloc((size_t)client_count, sizeof(*connections));
+    if (connections == NULL) {
+        fprintf(stderr, "allocation failed for per-client connection table\n");
+        rc = 1;
+        goto cleanup;
+    }
 
-    init_notify_ring(connection.request_queue, slot_count);
-    init_notify_ring(connection.response_queue, slot_count);
-    init_peterson_nodes(connection.request_lock_nodes,
-                        connection.lock_leaf_count > 0
-                            ? (connection.lock_leaf_count - 1)
+    init_notify_ring(shared_request.request_queue, slot_count);
+    init_peterson_nodes(shared_request.request_lock_nodes,
+                        shared_request.lock_leaf_count > 0
+                            ? (shared_request.lock_leaf_count - 1)
                             : 0);
     {
         struct RequestPublishState zero_publish_state = {0};
 
-        store_request_publish_state_remote(connection.request_publish_state,
+        store_request_publish_state_remote(shared_request.request_publish_state,
                                            &zero_publish_state);
     }
-    write_remote_u64(connection.response_consume_seq, 0);
+    for (uint64_t client_id = 0; client_id < client_count; client_id++) {
+        connections[client_id].response_queue =
+            alloc_shared_cxl(response_queue_size, cxl_node);
+        connections[client_id].request_data_area =
+            alloc_shared_cxl(request_data_size, cxl_node);
+        connections[client_id].response_data_area =
+            alloc_shared_cxl(response_data_size, cxl_node);
+        connections[client_id].request_data_size = request_data_size;
+        connections[client_id].response_data_size = response_data_size;
+        init_notify_ring(connections[client_id].response_queue, slot_count);
+    }
 
     child_pids = calloc((size_t)(client_count + 1), sizeof(*child_pids));
     control = alloc_shared_zeroed(sizeof(*control));
@@ -3203,8 +3237,8 @@ main(int argc, char **argv)
         g_trace_buffer = trace_buffer;
     }
 
-    if (child_pids == NULL) {
-        fprintf(stderr, "allocation failed for child pids\n");
+    if (connections == NULL || child_pids == NULL) {
+        fprintf(stderr, "allocation failed for shared connection state\n");
         rc = 1;
         goto cleanup;
     }
@@ -3220,7 +3254,8 @@ main(int argc, char **argv)
             goto cleanup;
         }
         if (pid == 0) {
-            int child_rc = run_server_shared(&connection,
+            int child_rc = run_server_shared(&shared_request,
+                                             connections,
                                              client_count,
                                              slot_count,
                                              request_count,
@@ -3259,7 +3294,8 @@ main(int argc, char **argv)
             goto wait_children;
         }
         if (pid == 0) {
-            int child_rc = run_client_shared(&connection,
+            int child_rc = run_client_shared(&shared_request,
+                                             &connections[client_id],
                                              client_count,
                                              client_id,
                                              window_size,
@@ -3445,33 +3481,33 @@ cleanup:
 #if HYDRARPC_APP_VARIANT
     free_app_runtime(&app_runtime, client_count);
 #endif
-    if (connection.request_queue != NULL) {
-        munmap((void *)connection.request_queue,
+    if (shared_request.request_queue != NULL) {
+        munmap((void *)shared_request.request_queue,
                shared_mapping_size(request_queue_size));
     }
-    if (connection.response_queue != NULL) {
-        munmap((void *)connection.response_queue,
-               shared_mapping_size(response_queue_size));
+    if (connections != NULL) {
+        for (uint64_t client_id = 0; client_id < client_count; client_id++) {
+            if (connections[client_id].response_queue != NULL) {
+                munmap((void *)connections[client_id].response_queue,
+                       shared_mapping_size(response_queue_size));
+            }
+            if (connections[client_id].request_data_area != NULL) {
+                munmap((void *)connections[client_id].request_data_area,
+                       shared_mapping_size(request_data_size));
+            }
+            if (connections[client_id].response_data_area != NULL) {
+                munmap((void *)connections[client_id].response_data_area,
+                       shared_mapping_size(response_data_size));
+            }
+        }
     }
-    if (connection.request_data_area != NULL) {
-        munmap((void *)connection.request_data_area,
-               shared_mapping_size(request_data_size));
-    }
-    if (connection.response_data_area != NULL) {
-        munmap((void *)connection.response_data_area,
-               shared_mapping_size(response_data_size));
-    }
-    if (connection.request_lock_nodes != NULL) {
-        munmap((void *)connection.request_lock_nodes,
+    if (shared_request.request_lock_nodes != NULL) {
+        munmap((void *)shared_request.request_lock_nodes,
                shared_mapping_size(request_lock_nodes_size));
     }
-    if (connection.request_publish_state != NULL) {
-        munmap((void *)connection.request_publish_state,
+    if (shared_request.request_publish_state != NULL) {
+        munmap((void *)shared_request.request_publish_state,
                shared_mapping_size(request_publish_state_size));
-    }
-    if (connection.response_consume_seq != NULL) {
-        munmap((void *)connection.response_consume_seq,
-               shared_mapping_size(response_consume_seq_size));
     }
     if (trace_buffer != NULL) {
         munmap((void *)trace_buffer, shared_mapping_size(trace_buffer_size));
@@ -3520,6 +3556,7 @@ cleanup:
                shared_mapping_size(sizeof(*timing.server_loop_start_ts_ns)));
     }
 
+    free(connections);
     free(child_pids);
     return rc;
 }

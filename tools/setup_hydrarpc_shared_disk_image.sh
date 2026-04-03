@@ -29,6 +29,7 @@ M5OPS_SOURCE="${REPO_ROOT}/util/m5/src/abi/x86/m5op.S"
 GUEST_DEST_DIR="/home/test_code"
 GUEST_BINARY="${GUEST_DEST_DIR}/${BINARY_NAME}"
 GUEST_WRAPPER="${GUEST_DEST_DIR}/run_${BINARY_NAME}.sh"
+GUEST_RESTORE_AUTORUN_WRAPPER="${GUEST_DEST_DIR}/run_hydrarpc_shared_restore_autorun.sh"
 LEGACY_GUEST_BINARY="${GUEST_DEST_DIR}/hydrarpc_multiclient_shared_send1_poll1"
 LEGACY_GUEST_WRAPPER="${GUEST_DEST_DIR}/run_hydrarpc_multiclient_shared_send1_poll1.sh"
 LEGACY_GUEST_WORKDIR="/root/hydrarpc"
@@ -150,8 +151,17 @@ set -eu
 exec numactl -N 0 -m 0 ${GUEST_BINARY} "\$@"
 EOF
 sudo install -m 0755 "${WRAPPER_TMP}" "${MOUNT_POINT}${GUEST_WRAPPER}"
+
+cat > "${WRAPPER_TMP}" <<'EOF'
+#!/bin/sh
+set -eu
+echo "shared restore autorun placeholder invoked; image was not patched for restore run"
+exec /bin/bash
+EOF
+sudo install -m 0755 "${WRAPPER_TMP}" "${MOUNT_POINT}${GUEST_RESTORE_AUTORUN_WRAPPER}"
 rm -f "${WRAPPER_TMP}"
 
 sync
 echo "Injected ${GUEST_BINARY} into ${DISK_IMAGE}"
 echo "Injected ${GUEST_WRAPPER} into ${DISK_IMAGE}"
+echo "Injected ${GUEST_RESTORE_AUTORUN_WRAPPER} into ${DISK_IMAGE}"

@@ -6,9 +6,14 @@ usage() {
 Usage:
   tools/install_hydrarpc_restore_autorun_in_image.sh <disk-image> <host-wrapper-script>
 
-Overwrite the existing coherent guest wrapper inside a disk image copy with a
-per-run wrapper script. The wrapper path already exists before checkpointing,
+Overwrite an existing guest wrapper inside a disk image copy with a per-run
+wrapper script. The wrapper path should already exist before checkpointing,
 which avoids restore-time issues with newly introduced guest file paths.
+
+Environment:
+  `HYDRARPC_RESTORE_AUTORUN_GUEST_WRAPPER`
+      Guest wrapper path to overwrite.
+      Default: `/home/test_code/run_hydrarpc_dedicated_coherent.sh`
 EOF
 }
 
@@ -17,7 +22,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DISK_IMAGE="${1:-}"
 HOST_WRAPPER_SCRIPT="${2:-}"
 GUEST_DEST_DIR="/home/test_code"
-GUEST_WRAPPER="${GUEST_DEST_DIR}/run_hydrarpc_dedicated_coherent.sh"
+GUEST_WRAPPER="${HYDRARPC_RESTORE_AUTORUN_GUEST_WRAPPER:-${GUEST_DEST_DIR}/run_hydrarpc_dedicated_coherent.sh}"
 MOUNT_POINT="/tmp/hydrarpc_restore_autorun_disk_$$"
 LOOP_DEVICE=""
 LOOP_PARTITION=""
