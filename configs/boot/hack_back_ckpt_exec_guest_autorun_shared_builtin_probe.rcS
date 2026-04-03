@@ -1,0 +1,67 @@
+#!/bin/sh
+
+# Builtins-only restore probe for shared classic checkpoints. This avoids
+# reading any guest-side wrapper from disk after restore so we can isolate
+# whether the handoff problem is caused by shell/file execution or by the
+# restore path itself.
+
+if [ "${RUNSCRIPT_VAR+set}" != set ]
+then
+	export RUNSCRIPT_VAR=1
+else
+	/sbin/m5 exit
+fi
+
+wait_for_guest_ready() {
+	ready_tries="${CHECKPOINT_READY_TRIES:-300}"
+	settle_secs="${CHECKPOINT_SETTLE_SECS:-30}"
+
+	echo "Waiting for Linux userspace readiness before checkpoint..."
+
+	while [ "$ready_tries" -gt 0 ]
+	do
+		state="$(systemctl is-system-running 2>/dev/null || true)"
+		if systemctl is-active --quiet multi-user.target
+		then
+			case "$state" in
+				running|degraded)
+					echo "Guest ready for checkpoint: state=${state}; settling ${settle_secs}s"
+					sleep "$settle_secs"
+					sync
+					return 0
+					;;
+			esac
+		fi
+
+		ready_tries=$((ready_tries - 1))
+		sleep 1
+	done
+
+	echo "checkpoint_ready_timeout state=${state:-unknown}"
+	return 1
+}
+
+if ! wait_for_guest_ready
+then
+	/sbin/m5 exit
+fi
+
+echo "Checkpointing simulation..."
+/sbin/m5 checkpoint
+
+if [ "$RUNSCRIPT_VAR" -eq 1 ]
+then
+	export RUNSCRIPT_VAR=2
+
+	echo "SHARED_BUILTIN_PROBE launch"
+	echo "SHARED_BUILTIN_PROBE marker_1"
+	probe_i=2
+	echo "SHARED_BUILTIN_PROBE marker_${probe_i}"
+	probe_i=$((probe_i + 1))
+	echo "SHARED_BUILTIN_PROBE marker_${probe_i}"
+	echo "SHARED_BUILTIN_PROBE done"
+	exit 0
+fi
+
+echo "Fell through script. Exiting..."
+/sbin/m5 exit
