@@ -134,24 +134,24 @@ run_coherence_group() {
   local args=()
 
   args=(bash tools/run_hydrarpc_sweep.sh
-    --root-outdir "$ROOT_OUTDIR/coherence_dedicated_noncc_direct_req64_resp64_pow2"
+    --root-outdir "$ROOT_OUTDIR/coherence_dedicated_noncc_staging_req64_resp64_pow2"
     --kinds "dedicated"
     --client-counts "1 2 4 8 16 32"
     --req-bytes 64
     --resp-bytes 64
-    --request-transfer-mode direct
-    --response-transfer-mode direct
+    --request-transfer-mode staging
+    --response-transfer-mode staging
   )
   append_common_sweep_args args
   run_cmd "${args[@]}"
 
   args=(bash tools/run_hydrarpc_coherent_sweep.sh
-    --root-outdir "$ROOT_OUTDIR/coherence_dedicated_cc_direct_req64_resp64_pow2"
+    --root-outdir "$ROOT_OUTDIR/coherence_dedicated_cc_staging_req64_resp64_pow2"
     --client-counts "1 2 4 8 16 32"
     --req-bytes 64
     --resp-bytes 64
-    --request-transfer-mode direct
-    --response-transfer-mode direct
+    --request-transfer-mode staging
+    --response-transfer-mode staging
   )
   append_common_sweep_args args
   run_cmd "${args[@]}"

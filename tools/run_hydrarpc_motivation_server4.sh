@@ -11,7 +11,7 @@ ensure_build
 ensure_dedicated_image
 ensure_coherent_image
 
-run_dedicated_cc_direct_pow2
+run_dedicated_cc_staging_pow2
 run_dedicated_respsize 1024
 run_dedicated_sparse32 28 15
 run_dedicated_sparse32 28 8

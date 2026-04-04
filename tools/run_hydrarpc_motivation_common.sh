@@ -171,14 +171,14 @@ run_dedicated_noncc_direct_pow2() {
     --response-transfer-mode direct
 }
 
-run_dedicated_cc_direct_pow2() {
+run_dedicated_cc_staging_pow2() {
   run_cc_sweep \
-    "moti_dedicated_cc_direct_req64_resp64_pow2" \
+    "moti_dedicated_cc_staging_req64_resp64_pow2" \
     --client-counts "1 2 4 8 16 32" \
     --req-bytes 64 \
     --resp-bytes 64 \
-    --request-transfer-mode direct \
-    --response-transfer-mode direct
+    --request-transfer-mode staging \
+    --response-transfer-mode staging
 }
 
 run_dedicated_respsize() {

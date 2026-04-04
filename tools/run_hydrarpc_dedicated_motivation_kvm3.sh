@@ -27,7 +27,7 @@ Options:
   --help                   Show this message.
 
 Shard layout:
-  machine 1: coherent direct pow2 + dedicated response-size motivation
+  machine 1: coherent staging pow2 + dedicated response-size motivation
   machine 2: non-coherent staging pow2 + half of sparse32
   machine 3: non-coherent direct pow2 + half of sparse32
 
@@ -216,8 +216,8 @@ run_cc_pow2() {
     --client-counts "1 2 4 8 16 32"
     --req-bytes 64
     --resp-bytes 64
-    --request-transfer-mode direct
-    --response-transfer-mode direct
+    --request-transfer-mode staging
+    --response-transfer-mode staging
   )
 
   append_common_cc_args args
@@ -302,7 +302,7 @@ run_machine1() {
   ensure_checkpoint classic
   ensure_checkpoint ruby "$CC_CHECKPOINT_BOOT_SCRIPT"
 
-  run_cc_pow2 "$ROOT_OUTDIR/cc_direct_req64_resp64_pow2"
+  run_cc_pow2 "$ROOT_OUTDIR/cc_staging_req64_resp64_pow2"
   run_respsize_batch
 }
 
