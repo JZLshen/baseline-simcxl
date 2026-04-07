@@ -20,7 +20,7 @@ Options:
   --refresh-checkpoint     Regenerate the selected boot checkpoint bundle.
   --client-count <N>       Number of client processes. Default: 1
   --count-per-client <N>   Requests per client. Default: 30
-  --window-size <N>        Max outstanding requests per client. Default: 16
+  --window-size <N>        Max outstanding requests per client. Default: 1
   --slot-count <N>         Per-client ring depth. Default: 1024
   --req-bytes <N>          Request payload bytes. Default: 64
   --resp-bytes <N>         Response payload bytes. Default: 64
@@ -85,7 +85,7 @@ CHECKPOINT_ID=""
 REFRESH_CHECKPOINT=0
 CLIENT_COUNT=1
 COUNT_PER_CLIENT=30
-WINDOW_SIZE=16
+WINDOW_SIZE=1
 SLOT_COUNT=1024
 REQ_BYTES=64
 RESP_BYTES=64

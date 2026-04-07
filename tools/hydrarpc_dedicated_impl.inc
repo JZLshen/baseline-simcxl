@@ -74,6 +74,8 @@ struct RequestTimingData {
     uint64_t *server_exec_done_ts_ns;
     uint64_t *server_resp_done_ts_ns;
     uint64_t *server_loop_start_ts_ns;
+    uint64_t *server_request_queue_poll_count;
+    uint64_t *server_request_queue_hit_count;
 };
 
 enum SendMode {
@@ -657,6 +659,13 @@ wait_for_first_round_completion(struct SharedControl *control,
     }
 
     return control_has_error(control) ? -1 : 0;
+}
+
+static inline int
+steady_state_started(struct SharedControl *control, uint64_t participant_count)
+{
+    return __atomic_load_n((const uint64_t *)&control->first_response_count,
+                           __ATOMIC_ACQUIRE) >= participant_count;
 }
 
 static inline void
@@ -1365,6 +1374,7 @@ run_server_dedicated(struct Connection *connections,
             uint64_t server_req_observe_ts = 0;
             uint64_t server_exec_done_ts = 0;
             uint64_t server_resp_done_ts = 0;
+            int count_steady_poll = 0;
             size_t index = 0;
             volatile struct NotifyQueueLine *request_queue_line = NULL;
             volatile struct NotifyQueueLine *response_queue_line = NULL;
@@ -1372,9 +1382,14 @@ run_server_dedicated(struct Connection *connections,
             slot = seq % slot_count;
             request_queue_line =
                 notify_queue_line_at(connection->request_queue, slot);
+            count_steady_poll = steady_state_started(control, client_count);
+            if (count_steady_poll)
+                timing->server_request_queue_poll_count[client_id]++;
             request_notify = load_notify_word_remote(request_queue_line);
             if (!notify_valid(request_notify))
                 continue;
+            if (count_steady_poll)
+                timing->server_request_queue_hit_count[client_id]++;
 
             if (seq >= client_request_count) {
                 fprintf(stderr,
@@ -1922,6 +1937,19 @@ write_results(FILE *stream,
                                                              slow_client_count,
                                                              slow_request_count);
 
+        fprintf(stream,
+                "client_%" PRIu64 "_server_request_queue_poll_count_steady=%" PRIu64 "\n",
+                client_id,
+                timing->server_request_queue_poll_count[client_id]);
+        fprintf(stream,
+                "client_%" PRIu64 "_server_request_queue_hit_count_steady=%" PRIu64 "\n",
+                client_id,
+                timing->server_request_queue_hit_count[client_id]);
+        fprintf(stream,
+                "client_%" PRIu64 "_request_target_steady=%" PRIu64 "\n",
+                client_id,
+                client_request_count > 0 ? client_request_count - 1u : 0u);
+
         for (uint64_t req_id = 0; req_id < client_request_count; req_id++) {
             size_t index = (size_t)(client_id * request_count + req_id);
 
@@ -2044,7 +2072,7 @@ main(int argc, char **argv)
     static const char result_log_name[] = HYDRARPC_VARIANT_NAME ".result.log";
     uint64_t client_count = 1;
     uint64_t request_count = 30;
-    uint64_t window_size = 16;
+    uint64_t window_size = 1;
     uint64_t slot_count = 0;
     uint64_t slow_client_count = 0;
     uint64_t slow_request_count = 0;
@@ -2526,6 +2554,12 @@ main(int argc, char **argv)
     timing.server_loop_start_ts_ns = alloc_shared_zeroed(
         sizeof(*timing.server_loop_start_ts_ns)
     );
+    timing.server_request_queue_poll_count = alloc_shared_zeroed(
+        sizeof(*timing.server_request_queue_poll_count) * client_count
+    );
+    timing.server_request_queue_hit_count = alloc_shared_zeroed(
+        sizeof(*timing.server_request_queue_hit_count) * client_count
+    );
 
     tracef("config client_count=%" PRIu64 " request_count=%" PRIu64
            " window_size=%" PRIu64 " slot_count=%" PRIu64
@@ -2758,6 +2792,16 @@ cleanup:
     if (timing.server_loop_start_ts_ns != NULL) {
         munmap((void *)timing.server_loop_start_ts_ns,
                shared_mapping_size(sizeof(*timing.server_loop_start_ts_ns)));
+    }
+    if (timing.server_request_queue_poll_count != NULL) {
+        munmap((void *)timing.server_request_queue_poll_count,
+               shared_mapping_size(sizeof(*timing.server_request_queue_poll_count) *
+                                   client_count));
+    }
+    if (timing.server_request_queue_hit_count != NULL) {
+        munmap((void *)timing.server_request_queue_hit_count,
+               shared_mapping_size(sizeof(*timing.server_request_queue_hit_count) *
+                                   client_count));
     }
 
     free(connections);

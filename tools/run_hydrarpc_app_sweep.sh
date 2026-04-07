@@ -13,7 +13,7 @@ Options:
   --profiles <list>        Quoted list from the current supported set:
                            "ycsb_a_1k ycsb_b_1k ycsb_c_1k ycsb_d_1k udb_a udb_b udb_c udb_d"
   --kinds <list>           Quoted list from "dedicated shared". Default: both
-  --window-size <N>        Max outstanding requests per client. Default: 16
+  --window-size <N>        Max outstanding requests per client. Default: 1
   --slot-count <N>         Ring depth passed to both shared and dedicated. Default: 1024
   --record-count <N>       Application KV record count. Default: 10000
   --dataset-seed <N>       Dataset seed passed into app binaries. Default: 0x9B5D3A4781C26EF1
@@ -44,7 +44,7 @@ CLIENT_COUNTS="32"
 APP_PROFILES_DEFAULT="ycsb_a_1k ycsb_b_1k ycsb_c_1k ycsb_d_1k udb_a udb_b udb_c udb_d"
 PROFILES="$APP_PROFILES_DEFAULT"
 KINDS="dedicated shared"
-WINDOW_SIZE=16
+WINDOW_SIZE=1
 SLOT_COUNT=1024
 RECORD_COUNT=10000
 DATASET_SEED="0x9B5D3A4781C26EF1"

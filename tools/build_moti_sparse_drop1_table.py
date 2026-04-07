@@ -5,6 +5,8 @@ import csv
 import json
 from pathlib import Path
 
+from drop1_table_metrics import METRIC_FIELDS, metrics_from_drop1_stats
+
 
 SLOW_CLIENT_COUNTS = (1, 2, 4, 8)
 SLOW_REQUEST_PCTS = (0, 25, 50, 100)
@@ -12,29 +14,8 @@ SLOW_REQUEST_PCTS = (0, 25, 50, 100)
 CSV_FIELDS = [
     "slow_client_count",
     "slow_request_pct",
-    "throughput_kops",
-    "latency_median_ns",
-    "latency_p90_ns",
-    "latency_p99_ns",
-    "server_poll_median_ns",
-    "server_poll_p90_ns",
-    "server_poll_p99_ns",
-    "server_execute_median_ns",
-    "server_execute_p90_ns",
-    "server_execute_p99_ns",
-    "server_response_median_ns",
-    "server_response_p90_ns",
-    "server_response_p99_ns",
+    *METRIC_FIELDS,
 ]
-
-
-def fmt_metric(value):
-    if value is None:
-        return ""
-    if isinstance(value, float):
-        return f"{value:.3f}"
-    return str(value)
-
 
 def load_drop1_stats(result_json_path: Path):
     payload = json.loads(result_json_path.read_text())
@@ -45,29 +26,12 @@ def load_drop1_stats(result_json_path: Path):
 
 
 def build_row(slow_client_count: int, slow_request_pct: int, stats):
-    return {
+    row = {
         "slow_client_count": slow_client_count,
         "slow_request_pct": slow_request_pct,
-        "throughput_kops": fmt_metric(stats.get("steady_avg_throughput_kops")),
-        "latency_median_ns": fmt_metric(stats.get("steady_median_latency_ns")),
-        "latency_p90_ns": fmt_metric(stats.get("steady_p90_latency_ns")),
-        "latency_p99_ns": fmt_metric(stats.get("steady_p99_latency_ns")),
-        "server_poll_median_ns": fmt_metric(
-            stats.get("steady_median_server_poll_notify_ns")
-        ),
-        "server_poll_p90_ns": fmt_metric(stats.get("steady_p90_server_poll_notify_ns")),
-        "server_poll_p99_ns": fmt_metric(stats.get("steady_p99_server_poll_notify_ns")),
-        "server_execute_median_ns": fmt_metric(
-            stats.get("steady_median_server_execute_ns")
-        ),
-        "server_execute_p90_ns": fmt_metric(stats.get("steady_p90_server_execute_ns")),
-        "server_execute_p99_ns": fmt_metric(stats.get("steady_p99_server_execute_ns")),
-        "server_response_median_ns": fmt_metric(
-            stats.get("steady_median_server_response_ns")
-        ),
-        "server_response_p90_ns": fmt_metric(stats.get("steady_p90_server_response_ns")),
-        "server_response_p99_ns": fmt_metric(stats.get("steady_p99_server_response_ns")),
     }
+    row.update(metrics_from_drop1_stats(stats))
+    return row
 
 
 def parse_args():
