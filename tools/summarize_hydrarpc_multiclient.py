@@ -57,13 +57,22 @@ def mrps_from_ns(request_count: int, total_ns):
     return request_count * 1000.0 / total_ns
 
 
+def kops_from_ns(request_count: int, total_ns):
+    mrps = mrps_from_ns(request_count, total_ns)
+    if mrps is None:
+        return None
+    return mrps * 1000.0
+
+
 def stats_from_distribution(prefix: str, values):
     if not values:
         return {}
 
     return {
         f"avg_{prefix}_ns": avg_or_none(values),
+        f"median_{prefix}_ns": safe_median(values),
         f"p50_{prefix}_ns": percentile_nearest_rank(values, 50),
+        f"p90_{prefix}_ns": percentile_nearest_rank(values, 90),
         f"p99_{prefix}_ns": percentile_nearest_rank(values, 99),
     }
 
@@ -208,8 +217,10 @@ def compute_window_stats(rows):
             "avg_latency_ns": None,
             "median_latency_ns": None,
             "p50_latency_ns": None,
+            "p90_latency_ns": None,
             "p99_latency_ns": None,
             "aggregate_throughput_mrps": None,
+            "aggregate_throughput_kops": None,
         }
 
     latencies = [row["latency_ns"] for row in rows]
@@ -225,8 +236,10 @@ def compute_window_stats(rows):
         "avg_latency_ns": avg_or_none(latencies),
         "median_latency_ns": safe_median(latencies),
         "p50_latency_ns": percentile_nearest_rank(latencies, 50),
+        "p90_latency_ns": percentile_nearest_rank(latencies, 90),
         "p99_latency_ns": percentile_nearest_rank(latencies, 99),
         "aggregate_throughput_mrps": mrps_from_ns(len(rows), total_e2e_ns),
+        "aggregate_throughput_kops": kops_from_ns(len(rows), total_e2e_ns),
     }
 
 
@@ -307,13 +320,30 @@ def compute_steady_stats(rows, drop_first_per_client: int):
         "steady_avg_reqresp_latency_ns": avg_or_none(kept_latencies),
         "steady_median_latency_ns": safe_median(kept_latencies),
         "steady_p50_latency_ns": percentile_nearest_rank(kept_latencies, 50),
+        "steady_p90_latency_ns": percentile_nearest_rank(kept_latencies, 90),
         "steady_p99_latency_ns": percentile_nearest_rank(kept_latencies, 99),
         "steady_avg_gap_ns": steady_avg_gap_ns,
         "steady_median_gap_ns": steady_median_gap_ns,
+        "steady_p90_gap_ns": percentile_nearest_rank(gaps, 90) if len(kept_end_ns) >= 2 else None,
         "steady_p99_gap_ns": steady_p99_gap_ns,
         "steady_avg_throughput_mrps": steady_avg_throughput_mrps,
+        "steady_avg_throughput_kops": (
+            steady_avg_throughput_mrps * 1000.0
+            if steady_avg_throughput_mrps is not None
+            else None
+        ),
         "steady_avg_gap_throughput_mrps": steady_avg_gap_throughput_mrps,
+        "steady_avg_gap_throughput_kops": (
+            steady_avg_gap_throughput_mrps * 1000.0
+            if steady_avg_gap_throughput_mrps is not None
+            else None
+        ),
         "steady_median_throughput_mrps": steady_median_throughput_mrps,
+        "steady_median_throughput_kops": (
+            steady_median_throughput_mrps * 1000.0
+            if steady_median_throughput_mrps is not None
+            else None
+        ),
     }
 
 
@@ -399,6 +429,31 @@ def prefix_stats(prefix: str, stats: dict):
     return {f"{prefix}{key}": value for key, value in stats.items()}
 
 
+def ordered_unique_drops(*drop_values):
+    ordered = []
+    seen = set()
+
+    for drop in drop_values:
+        if drop in seen:
+            continue
+        seen.add(drop)
+        ordered.append(drop)
+
+    return ordered
+
+
+def compute_steady_stats_with_server_phase(rows, server_phase_durations, drop_first_per_client: int):
+    steady_stats = compute_steady_stats(rows, drop_first_per_client)
+    steady_rows, _ = select_steady_rows(rows, drop_first_per_client)
+    steady_stats.update(
+        prefix_stats(
+            "steady_",
+            summarize_server_phase_durations(steady_rows, server_phase_durations),
+        )
+    )
+    return steady_stats
+
+
 def print_float(name: str, value):
     if value is None:
         print(f"{name}=")
@@ -437,15 +492,25 @@ def build_summary_csv_row(
         "avg_latency_ns": fmt_optional_float(stats["avg_latency_ns"], 3),
         "median_latency_ns": fmt_optional_float(stats["median_latency_ns"], 3),
         "p50_latency_ns": fmt_optional_float(stats["p50_latency_ns"], 3),
+        "p90_latency_ns": fmt_optional_float(stats["p90_latency_ns"], 3),
         "p99_latency_ns": fmt_optional_float(stats["p99_latency_ns"], 3),
         "aggregate_throughput_mrps": fmt_optional_float(
             stats["aggregate_throughput_mrps"], 6
         ),
+        "aggregate_throughput_kops": fmt_optional_float(
+            stats["aggregate_throughput_kops"], 3
+        ),
         "avg_server_poll_notify_ns": fmt_optional_float(
             stats.get("avg_server_poll_notify_ns"), 3
         ),
+        "median_server_poll_notify_ns": fmt_optional_float(
+            stats.get("median_server_poll_notify_ns"), 3
+        ),
         "p50_server_poll_notify_ns": fmt_optional_float(
             stats.get("p50_server_poll_notify_ns"), 3
+        ),
+        "p90_server_poll_notify_ns": fmt_optional_float(
+            stats.get("p90_server_poll_notify_ns"), 3
         ),
         "p99_server_poll_notify_ns": fmt_optional_float(
             stats.get("p99_server_poll_notify_ns"), 3
@@ -453,8 +518,14 @@ def build_summary_csv_row(
         "avg_server_execute_ns": fmt_optional_float(
             stats.get("avg_server_execute_ns"), 3
         ),
+        "median_server_execute_ns": fmt_optional_float(
+            stats.get("median_server_execute_ns"), 3
+        ),
         "p50_server_execute_ns": fmt_optional_float(
             stats.get("p50_server_execute_ns"), 3
+        ),
+        "p90_server_execute_ns": fmt_optional_float(
+            stats.get("p90_server_execute_ns"), 3
         ),
         "p99_server_execute_ns": fmt_optional_float(
             stats.get("p99_server_execute_ns"), 3
@@ -462,8 +533,14 @@ def build_summary_csv_row(
         "avg_server_response_ns": fmt_optional_float(
             stats.get("avg_server_response_ns"), 3
         ),
+        "median_server_response_ns": fmt_optional_float(
+            stats.get("median_server_response_ns"), 3
+        ),
         "p50_server_response_ns": fmt_optional_float(
             stats.get("p50_server_response_ns"), 3
+        ),
+        "p90_server_response_ns": fmt_optional_float(
+            stats.get("p90_server_response_ns"), 3
         ),
         "p99_server_response_ns": fmt_optional_float(
             stats.get("p99_server_response_ns"), 3
@@ -505,6 +582,9 @@ def build_steady_csv_row(
         "steady_p50_latency_ns": fmt_optional_float(
             steady_stats["steady_p50_latency_ns"], 3
         ),
+        "steady_p90_latency_ns": fmt_optional_float(
+            steady_stats["steady_p90_latency_ns"], 3
+        ),
         "steady_p99_latency_ns": fmt_optional_float(
             steady_stats["steady_p99_latency_ns"], 3
         ),
@@ -514,23 +594,41 @@ def build_steady_csv_row(
         "steady_median_gap_ns": fmt_optional_float(
             steady_stats["steady_median_gap_ns"], 3
         ),
+        "steady_p90_gap_ns": fmt_optional_float(
+            steady_stats["steady_p90_gap_ns"], 3
+        ),
         "steady_p99_gap_ns": fmt_optional_float(
             steady_stats["steady_p99_gap_ns"], 3
         ),
         "steady_avg_throughput_mrps": fmt_optional_float(
             steady_stats["steady_avg_throughput_mrps"], 6
         ),
+        "steady_avg_throughput_kops": fmt_optional_float(
+            steady_stats["steady_avg_throughput_kops"], 3
+        ),
         "steady_avg_gap_throughput_mrps": fmt_optional_float(
             steady_stats["steady_avg_gap_throughput_mrps"], 6
+        ),
+        "steady_avg_gap_throughput_kops": fmt_optional_float(
+            steady_stats["steady_avg_gap_throughput_kops"], 3
         ),
         "steady_median_throughput_mrps": fmt_optional_float(
             steady_stats["steady_median_throughput_mrps"], 6
         ),
+        "steady_median_throughput_kops": fmt_optional_float(
+            steady_stats["steady_median_throughput_kops"], 3
+        ),
         "steady_avg_server_poll_notify_ns": fmt_optional_float(
             steady_stats.get("steady_avg_server_poll_notify_ns"), 3
         ),
+        "steady_median_server_poll_notify_ns": fmt_optional_float(
+            steady_stats.get("steady_median_server_poll_notify_ns"), 3
+        ),
         "steady_p50_server_poll_notify_ns": fmt_optional_float(
             steady_stats.get("steady_p50_server_poll_notify_ns"), 3
+        ),
+        "steady_p90_server_poll_notify_ns": fmt_optional_float(
+            steady_stats.get("steady_p90_server_poll_notify_ns"), 3
         ),
         "steady_p99_server_poll_notify_ns": fmt_optional_float(
             steady_stats.get("steady_p99_server_poll_notify_ns"), 3
@@ -538,8 +636,14 @@ def build_steady_csv_row(
         "steady_avg_server_execute_ns": fmt_optional_float(
             steady_stats.get("steady_avg_server_execute_ns"), 3
         ),
+        "steady_median_server_execute_ns": fmt_optional_float(
+            steady_stats.get("steady_median_server_execute_ns"), 3
+        ),
         "steady_p50_server_execute_ns": fmt_optional_float(
             steady_stats.get("steady_p50_server_execute_ns"), 3
+        ),
+        "steady_p90_server_execute_ns": fmt_optional_float(
+            steady_stats.get("steady_p90_server_execute_ns"), 3
         ),
         "steady_p99_server_execute_ns": fmt_optional_float(
             steady_stats.get("steady_p99_server_execute_ns"), 3
@@ -547,8 +651,14 @@ def build_steady_csv_row(
         "steady_avg_server_response_ns": fmt_optional_float(
             steady_stats.get("steady_avg_server_response_ns"), 3
         ),
+        "steady_median_server_response_ns": fmt_optional_float(
+            steady_stats.get("steady_median_server_response_ns"), 3
+        ),
         "steady_p50_server_response_ns": fmt_optional_float(
             steady_stats.get("steady_p50_server_response_ns"), 3
+        ),
+        "steady_p90_server_response_ns": fmt_optional_float(
+            steady_stats.get("steady_p90_server_response_ns"), 3
         ),
         "steady_p99_server_response_ns": fmt_optional_float(
             steady_stats.get("steady_p99_server_response_ns"), 3
@@ -594,6 +704,8 @@ def write_result_json(
     extra_fields=None,
     stats=None,
     steady_stats=None,
+    steady_drop1_stats=None,
+    steady_drop5_stats=None,
     error=None,
 ):
     payload = {
@@ -611,6 +723,10 @@ def write_result_json(
         payload["stats"] = stats
     if steady_stats is not None:
         payload["steady_stats"] = steady_stats
+    if steady_drop1_stats is not None:
+        payload["steady_drop1_stats"] = steady_drop1_stats
+    if steady_drop5_stats is not None:
+        payload["steady_drop5_stats"] = steady_drop5_stats
     if error is not None:
         payload["error"] = error
 
@@ -671,18 +787,26 @@ def print_summary(
     print_float("avg_latency_ns", stats["avg_latency_ns"])
     print_float("median_latency_ns", stats["median_latency_ns"])
     print_float("p50_latency_ns", stats["p50_latency_ns"])
+    print_float("p90_latency_ns", stats["p90_latency_ns"])
     print_float("p99_latency_ns", stats["p99_latency_ns"])
     print_float("aggregate_throughput_mrps", stats["aggregate_throughput_mrps"])
+    print_float("aggregate_throughput_kops", stats["aggregate_throughput_kops"])
 
     for key in (
         "avg_server_poll_notify_ns",
+        "median_server_poll_notify_ns",
         "p50_server_poll_notify_ns",
+        "p90_server_poll_notify_ns",
         "p99_server_poll_notify_ns",
         "avg_server_execute_ns",
+        "median_server_execute_ns",
         "p50_server_execute_ns",
+        "p90_server_execute_ns",
         "p99_server_execute_ns",
         "avg_server_response_ns",
+        "median_server_response_ns",
         "p50_server_response_ns",
+        "p90_server_response_ns",
         "p99_server_response_ns",
     ):
         if key in stats:
@@ -707,32 +831,52 @@ def print_summary(
         steady_stats["steady_median_latency_ns"],
     )
     print_float("steady_p50_latency_ns", steady_stats["steady_p50_latency_ns"])
+    print_float("steady_p90_latency_ns", steady_stats["steady_p90_latency_ns"])
     print_float("steady_p99_latency_ns", steady_stats["steady_p99_latency_ns"])
     print_float("steady_avg_gap_ns", steady_stats["steady_avg_gap_ns"])
     print_float("steady_median_gap_ns", steady_stats["steady_median_gap_ns"])
+    print_float("steady_p90_gap_ns", steady_stats["steady_p90_gap_ns"])
     print_float("steady_p99_gap_ns", steady_stats["steady_p99_gap_ns"])
     print_float(
         "steady_avg_throughput_mrps",
         steady_stats["steady_avg_throughput_mrps"],
     )
     print_float(
+        "steady_avg_throughput_kops",
+        steady_stats["steady_avg_throughput_kops"],
+    )
+    print_float(
         "steady_avg_gap_throughput_mrps",
         steady_stats["steady_avg_gap_throughput_mrps"],
+    )
+    print_float(
+        "steady_avg_gap_throughput_kops",
+        steady_stats["steady_avg_gap_throughput_kops"],
     )
     print_float(
         "steady_median_throughput_mrps",
         steady_stats["steady_median_throughput_mrps"],
     )
+    print_float(
+        "steady_median_throughput_kops",
+        steady_stats["steady_median_throughput_kops"],
+    )
 
     for key in (
         "steady_avg_server_poll_notify_ns",
+        "steady_median_server_poll_notify_ns",
         "steady_p50_server_poll_notify_ns",
+        "steady_p90_server_poll_notify_ns",
         "steady_p99_server_poll_notify_ns",
         "steady_avg_server_execute_ns",
+        "steady_median_server_execute_ns",
         "steady_p50_server_execute_ns",
+        "steady_p90_server_execute_ns",
         "steady_p99_server_execute_ns",
         "steady_avg_server_response_ns",
+        "steady_median_server_response_ns",
         "steady_p50_server_response_ns",
+        "steady_p90_server_response_ns",
         "steady_p99_server_response_ns",
     ):
         if key in steady_stats:
@@ -746,7 +890,7 @@ def parse_args():
     parser.add_argument("--client-count", type=int, required=True)
     parser.add_argument("--count-per-client", type=int, required=True)
     parser.add_argument("--expected-total-requests", type=int)
-    parser.add_argument("--drop-first-per-client", type=int, default=1)
+    parser.add_argument("--drop-first-per-client", type=int, default=2)
     parser.add_argument("--csv")
     parser.add_argument("--steady-csv")
     parser.add_argument("--fail-csv")
@@ -888,14 +1032,25 @@ def main():
     stats = compute_window_stats(rows)
     stats.update(summarize_server_phase_durations(rows, server_phase_durations))
 
-    steady_stats = compute_steady_stats(rows, args.drop_first_per_client)
-    steady_rows, _ = select_steady_rows(rows, args.drop_first_per_client)
-    steady_stats.update(
-        prefix_stats(
-            "steady_",
-            summarize_server_phase_durations(steady_rows, server_phase_durations),
-        )
+    steady_drop1_stats = compute_steady_stats_with_server_phase(
+        rows, server_phase_durations, 1
     )
+    steady_drop5_stats = compute_steady_stats_with_server_phase(
+        rows, server_phase_durations, 5
+    )
+    steady_stats_by_drop = {
+        1: steady_drop1_stats,
+        5: steady_drop5_stats,
+    }
+    if args.drop_first_per_client not in steady_stats_by_drop:
+        steady_stats_by_drop[args.drop_first_per_client] = (
+            compute_steady_stats_with_server_phase(
+                rows,
+                server_phase_durations,
+                args.drop_first_per_client,
+            )
+        )
+    steady_stats = steady_stats_by_drop[args.drop_first_per_client]
 
     print_summary(benchmark_rc, guest_command_rc, stats, steady_stats)
 
@@ -911,16 +1066,24 @@ def main():
             "avg_latency_ns",
             "median_latency_ns",
             "p50_latency_ns",
+            "p90_latency_ns",
             "p99_latency_ns",
             "aggregate_throughput_mrps",
+            "aggregate_throughput_kops",
             "avg_server_poll_notify_ns",
+            "median_server_poll_notify_ns",
             "p50_server_poll_notify_ns",
+            "p90_server_poll_notify_ns",
             "p99_server_poll_notify_ns",
             "avg_server_execute_ns",
+            "median_server_execute_ns",
             "p50_server_execute_ns",
+            "p90_server_execute_ns",
             "p99_server_execute_ns",
             "avg_server_response_ns",
+            "median_server_response_ns",
             "p50_server_response_ns",
+            "p90_server_response_ns",
             "p99_server_response_ns",
             "outdir",
             "log_path",
@@ -957,40 +1120,52 @@ def main():
             "steady_avg_reqresp_latency_ns",
             "steady_median_latency_ns",
             "steady_p50_latency_ns",
+            "steady_p90_latency_ns",
             "steady_p99_latency_ns",
             "steady_avg_gap_ns",
             "steady_median_gap_ns",
+            "steady_p90_gap_ns",
             "steady_p99_gap_ns",
             "steady_avg_throughput_mrps",
+            "steady_avg_throughput_kops",
             "steady_avg_gap_throughput_mrps",
+            "steady_avg_gap_throughput_kops",
             "steady_median_throughput_mrps",
+            "steady_median_throughput_kops",
             "steady_avg_server_poll_notify_ns",
+            "steady_median_server_poll_notify_ns",
             "steady_p50_server_poll_notify_ns",
+            "steady_p90_server_poll_notify_ns",
             "steady_p99_server_poll_notify_ns",
             "steady_avg_server_execute_ns",
+            "steady_median_server_execute_ns",
             "steady_p50_server_execute_ns",
+            "steady_p90_server_execute_ns",
             "steady_p99_server_execute_ns",
             "steady_avg_server_response_ns",
+            "steady_median_server_response_ns",
             "steady_p50_server_response_ns",
+            "steady_p90_server_response_ns",
             "steady_p99_server_response_ns",
             "outdir",
             "log_path",
         ]
-        steady_row = build_steady_csv_row(
-            args.experiment,
-            args.client_count,
-            args.count_per_client,
-            args.outdir,
-            str(log_path),
-            steady_stats,
-        )
-        steady_row.update(extra_fields)
         steady_fieldnames.extend(extra_fields.keys())
-        append_csv_row(
-            pathlib.Path(args.steady_csv),
-            steady_fieldnames,
-            steady_row,
-        )
+        for drop in ordered_unique_drops(args.drop_first_per_client):
+            steady_row = build_steady_csv_row(
+                args.experiment,
+                args.client_count,
+                args.count_per_client,
+                args.outdir,
+                str(log_path),
+                steady_stats_by_drop[drop],
+            )
+            steady_row.update(extra_fields)
+            append_csv_row(
+                pathlib.Path(args.steady_csv),
+                steady_fieldnames,
+                steady_row,
+            )
 
     if args.result_json:
         write_result_json(
@@ -1005,6 +1180,8 @@ def main():
             extra_fields=extra_fields,
             stats=stats,
             steady_stats=steady_stats,
+            steady_drop1_stats=steady_drop1_stats,
+            steady_drop5_stats=steady_drop5_stats,
         )
 
     return 0

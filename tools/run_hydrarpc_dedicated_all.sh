@@ -152,7 +152,7 @@ COMMON_DEDICATED=(
 EXTRA_SWEEP_ARGS=()
 EXTRA_APP_ARGS=()
 OVERALL_CLIENT_COUNTS="1 2 4 8 16 32"
-APP_PROFILES="ycsb_a_1k ycsb_b_1k ycsb_c_1k ycsb_f_1k udb_ro"
+APP_PROFILES="ycsb_a_1k ycsb_b_1k ycsb_c_1k ycsb_d_1k udb_a udb_b udb_c udb_d"
 OVERALL_REQ1530_RESP315_UNIFORM_ARGS=(
   --req-bytes 1530
   --resp-bytes 315

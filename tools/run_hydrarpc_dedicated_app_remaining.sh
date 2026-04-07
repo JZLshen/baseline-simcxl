@@ -21,12 +21,15 @@ Options:
   --continue-on-failure    Record failed runs and continue the sweep.
   --help                   Show this message.
 
-This launcher only covers the remaining dedicated application profiles:
+This launcher covers the current dedicated application profiles:
   - ycsb_a_1k
   - ycsb_b_1k
   - ycsb_c_1k
-  - ycsb_f_1k
-  - udb_ro
+  - ycsb_d_1k
+  - udb_a
+  - udb_b
+  - udb_c
+  - udb_d
 EOF
 }
 
@@ -155,7 +158,7 @@ args=(
   bash tools/run_hydrarpc_app_sweep.sh
   --root-outdir "$ROOT_OUTDIR"
   --client-counts "32"
-  --profiles "ycsb_a_1k ycsb_b_1k ycsb_c_1k ycsb_f_1k udb_ro"
+  --profiles "ycsb_a_1k ycsb_b_1k ycsb_c_1k ycsb_d_1k udb_a udb_b udb_c udb_d"
   --kinds dedicated
   --count-per-client "$COUNT_PER_CLIENT"
   --record-count 10000

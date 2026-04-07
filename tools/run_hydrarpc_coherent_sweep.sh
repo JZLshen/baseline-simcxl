@@ -29,7 +29,8 @@ Options:
   --restore-checkpoint <dir>
                            Reuse an existing boot checkpoint for each run.
   --restore-dispatch <mode>
-                           Restored workload dispatch: readfile or guest-file.
+                           Restored workload dispatch: readfile, guest-file,
+                           or guest-shell.
                            Default: readfile
   --guest-file-disk-image <path>
                            Reusable private disk image for guest-file restore.
@@ -192,7 +193,7 @@ export DISK_IMAGE="${DISK_IMAGE:-${REPO_ROOT}/files/parsec.img}"
 cd "$REPO_ROOT"
 
 case "$RESTORE_DISPATCH" in
-  readfile|guest-file)
+  readfile|guest-file|guest-shell)
     ;;
   *)
     echo "unsupported --restore-dispatch: $RESTORE_DISPATCH" >&2
@@ -303,36 +304,6 @@ is_transient_cpu_failure() {
     2>/dev/null
 }
 
-is_incomplete_guest_run() {
-  local outdir="$1"
-  local result_log="$outdir/hydrarpc_dedicated_coherent.result.log"
-  local console_log="$outdir/console.log"
-
-  if [[ ! -f "$result_log" ]]; then
-    return 0
-  fi
-
-  if rg -q '^benchmark_rc=0$' "$result_log" 2>/dev/null && \
-     rg -q '^guest_command_rc=0$' "$result_log" 2>/dev/null; then
-    return 1
-  fi
-
-  if rg -q 'incomplete timing records: got_total=0|incomplete timing records: missing_end=' \
-    "$console_log" 2>/dev/null; then
-    return 0
-  fi
-
-  if ! rg -q '^benchmark_rc=' "$result_log" 2>/dev/null; then
-    return 0
-  fi
-
-  if ! rg -q '^guest_command_rc=' "$result_log" 2>/dev/null; then
-    return 0
-  fi
-
-  return 1
-}
-
 archive_retry_outdir() {
   local outdir="$1"
   local attempt="$2"
@@ -420,14 +391,6 @@ run_runner_only() {
 
     if [[ "$attempt" -lt "$max_attempts" ]] && is_transient_cpu_failure "$outdir"; then
       echo "[$(date '+%F %T')] RETRY client_count=${client_count} attempt=${attempt} reason=transient_guest_cpu_failure" \
-        | tee -a "$RUN_LOG"
-      archive_retry_outdir "$outdir" "$attempt"
-      attempt=$((attempt + 1))
-      continue
-    fi
-
-    if [[ "$attempt" -lt "$max_attempts" ]] && is_incomplete_guest_run "$outdir"; then
-      echo "[$(date '+%F %T')] RETRY client_count=${client_count} attempt=${attempt} reason=incomplete_guest_run" \
         | tee -a "$RUN_LOG"
       archive_retry_outdir "$outdir" "$attempt"
       attempt=$((attempt + 1))

@@ -1,0 +1,72 @@
+#!/bin/sh
+
+# Manual checkpoint flow for coherent Ruby runs.
+# After restore, do not auto-run a fixed wrapper. Instead, stop the serial
+# getty, spawn an interactive bash on ttyS0, and keep the restore context
+# alive so the host can inject a per-run command over gem5's terminal port.
+
+if [ "${RUNSCRIPT_VAR+set}" != set ]
+then
+	export RUNSCRIPT_VAR=1
+else
+	/sbin/m5 exit
+fi
+
+wait_for_guest_ready() {
+	ready_tries="${CHECKPOINT_READY_TRIES:-300}"
+	settle_secs="${CHECKPOINT_SETTLE_SECS:-30}"
+
+	echo "Waiting for Linux userspace readiness before checkpoint..."
+
+	while [ "$ready_tries" -gt 0 ]
+	do
+		state="$(systemctl is-system-running 2>/dev/null || true)"
+		if systemctl is-active --quiet multi-user.target
+		then
+			case "$state" in
+				running|degraded)
+					echo "Guest ready for checkpoint: state=${state}; settling ${settle_secs}s"
+					sleep "$settle_secs"
+					sync
+					return 0
+					;;
+			esac
+		fi
+
+		ready_tries=$((ready_tries - 1))
+		sleep 1
+	done
+
+	echo "checkpoint_ready_timeout state=${state:-unknown}"
+	return 1
+}
+
+if ! wait_for_guest_ready
+then
+	/sbin/m5 exit
+fi
+
+echo "Checkpointing simulation..."
+/sbin/m5 checkpoint
+
+if [ "$RUNSCRIPT_VAR" -eq 1 ]
+then
+	export RUNSCRIPT_VAR=2
+	echo "MANUAL_DEBUG_READY coherent ruby restore reached"
+	echo "Use the serial terminal to run commands manually."
+	systemctl stop serial-getty@ttyS0.service >/dev/null 2>&1 || true
+	if command -v setsid >/dev/null 2>&1
+	then
+		setsid /bin/bash -i </dev/ttyS0 >/dev/ttyS0 2>&1 &
+	else
+		/bin/bash -i </dev/ttyS0 >/dev/ttyS0 2>&1 &
+	fi
+	echo "MANUAL_DEBUG_SHELL_SPAWNED on ttyS0"
+	while true
+	do
+		sleep 3600
+	done
+fi
+
+echo "Fell through script. Exiting..."
+/sbin/m5 exit

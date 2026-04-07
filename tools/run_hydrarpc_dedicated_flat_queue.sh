@@ -409,7 +409,7 @@ for latency in 100ns 200ns 300ns; do
     --cxl-bridge-extra-latency "$latency"
 done
 
-for profile in ycsb_a_1k ycsb_b_1k ycsb_c_1k ycsb_f_1k udb_ro; do
+for profile in ycsb_a_1k ycsb_b_1k ycsb_c_1k ycsb_d_1k udb_a udb_b udb_c udb_d; do
   submit_app_point "$profile"
 done
 

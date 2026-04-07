@@ -36,7 +36,7 @@ SKIP_EXISTING=0
 CONTINUE_ON_FAILURE=0
 ANY_FAILURES=0
 OVERALL_CLIENT_COUNTS="1 2 4 8 16 32"
-APP_PROFILES="ycsb_a_1k ycsb_b_1k ycsb_c_1k ycsb_f_1k udb_ro"
+APP_PROFILES="ycsb_a_1k ycsb_b_1k ycsb_c_1k ycsb_d_1k udb_a udb_b udb_c udb_d"
 OVERALL_REQ1530_RESP315_UNIFORM_ARGS=(
   --req-bytes 1530
   --resp-bytes 315
@@ -259,14 +259,14 @@ run_latency_point() {
 }
 
 run_sparse_point() {
-  local slow_client_count="$1"
-  local slow_count_per_client="$2"
+  local slow_request_pct="$1"
+  local slow_client_count="$2"
+  local slow_count_per_client="$3"
 
   run_dedicated_sweep 1 \
-    "$ROOT_OUTDIR/sensitivity/sparse32_sc${slow_client_count}_sq${slow_count_per_client}" \
-    --client-counts "32" \
-    --req-bytes 64 \
-    --resp-bytes 64 \
+    "$ROOT_OUTDIR/sensitivity/sparse16_d${slow_request_pct}_c${slow_client_count}" \
+    --client-counts "16" \
+    "${OVERALL_REQ38_RESP230_UNIFORM_ARGS[@]}" \
     --slow-client-count "$slow_client_count" \
     --slow-count-per-client "$slow_count_per_client" \
     --slow-send-gap-ns 20000 \
@@ -321,12 +321,22 @@ run_latency_points_phase() {
 
 run_sparse_points_phase() {
   local point_cap="$1"
+  local slow_request_pct=""
   local slow_count_per_client=""
   local slow_client_count=""
 
-  for slow_count_per_client in 8 15; do
-    for slow_client_count in 4 8 16 20 24 28; do
-      run_sparse_point "$slow_client_count" "$slow_count_per_client" &
+  for slow_request_pct in 0 25 50; do
+    case "$slow_request_pct" in
+      0) slow_count_per_client=0 ;;
+      25) slow_count_per_client=8 ;;
+      50) slow_count_per_client=15 ;;
+      *)
+        echo "unsupported slow_request_pct: $slow_request_pct" >&2
+        exit 1
+        ;;
+    esac
+    for slow_client_count in 1 2 4 8; do
+      run_sparse_point "$slow_request_pct" "$slow_client_count" "$slow_count_per_client" &
       wait_for_onepoint_cap "$point_cap"
     done
   done

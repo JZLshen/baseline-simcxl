@@ -34,7 +34,8 @@ Options:
                            Restore from an existing boot checkpoint and start
                            directly with CPU_TYPE cores.
   --restore-dispatch <mode>
-                           Restored workload dispatch: readfile or guest-file.
+                           Restored workload dispatch: readfile, guest-file,
+                           or guest-shell.
                            Default: readfile
   --guest-file-disk-image <path>
                            Reusable private disk image used by guest-file
@@ -56,8 +57,9 @@ Fixed resources:
 The coherent dedicated guest binary is built on the host, injected into the
 disk image, then launched from a small readfile workload after the first m5
 exit switches from BOOT_CPU to CPU_TYPE. Ruby restore can hang in m5 readfile,
-so guest-file dispatch instead runs a guest-resident autorun wrapper from a
-private disk image copy.
+so guest-file dispatch runs a guest-resident autorun wrapper from a private
+disk image copy, while guest-shell dispatch reuses one checkpoint and sends a
+per-run command over ttyS0.
 EOF
 }
 
@@ -253,7 +255,7 @@ if [[ -n "$RESTORE_CHECKPOINT" ]]; then
 fi
 
 case "$RESTORE_DISPATCH" in
-  readfile|guest-file)
+  readfile|guest-file|guest-shell)
     ;;
   *)
     echo "unsupported --restore-dispatch: $RESTORE_DISPATCH" >&2
@@ -261,8 +263,8 @@ case "$RESTORE_DISPATCH" in
     ;;
 esac
 
-if [[ "$RESTORE_DISPATCH" == "guest-file" && -z "$RESTORE_CHECKPOINT" ]]; then
-  echo "--restore-dispatch guest-file requires --restore-checkpoint" >&2
+if [[ "$RESTORE_DISPATCH" != "readfile" && -z "$RESTORE_CHECKPOINT" ]]; then
+  echo "--restore-dispatch ${RESTORE_DISPATCH} requires --restore-checkpoint" >&2
   exit 1
 fi
 
@@ -325,7 +327,9 @@ if [[ "$SKIP_IMAGE_SETUP" -eq 0 && "$RESTORE_DISPATCH" != "guest-file" ]]; then
 fi
 
 GUEST_CMD="/home/test_code/run_hydrarpc_dedicated_coherent.sh --client-count ${CLIENT_COUNT} --count-per-client ${COUNT_PER_CLIENT} --window-size ${WINDOW_SIZE} --slot-count ${SLOT_COUNT} --req-bytes ${REQ_BYTES} --resp-bytes ${RESP_BYTES} --slow-client-count ${SLOW_CLIENT_COUNT} --slow-count-per-client ${SLOW_COUNT_PER_CLIENT} --slow-send-gap-ns ${SLOW_SEND_GAP_NS} --send-mode ${SEND_MODE} --send-gap-ns ${SEND_GAP_NS} --request-transfer-mode ${REQUEST_TRANSFER_MODE} --response-transfer-mode ${RESPONSE_TRANSFER_MODE} --cxl-node ${CXL_NODE} --server-cpu ${SERVER_CPU}"
-GUEST_RESTORE_CMD="/home/test_code/hydrarpc_dedicated_coherent --client-count ${CLIENT_COUNT} --count-per-client ${COUNT_PER_CLIENT} --window-size ${WINDOW_SIZE} --slot-count ${SLOT_COUNT} --req-bytes ${REQ_BYTES} --resp-bytes ${RESP_BYTES} --slow-client-count ${SLOW_CLIENT_COUNT} --slow-count-per-client ${SLOW_COUNT_PER_CLIENT} --slow-send-gap-ns ${SLOW_SEND_GAP_NS} --send-mode ${SEND_MODE} --send-gap-ns ${SEND_GAP_NS} --request-transfer-mode ${REQUEST_TRANSFER_MODE} --response-transfer-mode ${RESPONSE_TRANSFER_MODE} --cxl-node ${CXL_NODE} --server-cpu ${SERVER_CPU}"
+# Keep guest-file restore aligned with the validated guest wrapper path baked
+# into the checkpoint image instead of bypassing it with the raw binary.
+GUEST_RESTORE_CMD="/home/test_code/run_hydrarpc_dedicated_coherent.sh --client-count ${CLIENT_COUNT} --count-per-client ${COUNT_PER_CLIENT} --window-size ${WINDOW_SIZE} --slot-count ${SLOT_COUNT} --req-bytes ${REQ_BYTES} --resp-bytes ${RESP_BYTES} --slow-client-count ${SLOW_CLIENT_COUNT} --slow-count-per-client ${SLOW_COUNT_PER_CLIENT} --slow-send-gap-ns ${SLOW_SEND_GAP_NS} --send-mode ${SEND_MODE} --send-gap-ns ${SEND_GAP_NS} --request-transfer-mode ${REQUEST_TRANSFER_MODE} --response-transfer-mode ${RESPONSE_TRANSFER_MODE} --cxl-node ${CXL_NODE} --server-cpu ${SERVER_CPU}"
 if [[ "$GUEST_TRACE" -eq 1 ]]; then
   GUEST_CMD="env HYDRARPC_TRACE=1 ${GUEST_CMD}"
   GUEST_RESTORE_CMD="env HYDRARPC_TRACE=1 ${GUEST_RESTORE_CMD}"
@@ -333,6 +337,14 @@ fi
 WORKLOAD_FILE="$OUTDIR/hydrarpc_dedicated_coherent.runscript"
 RESTORE_WORKLOAD_FILE="$OUTDIR/hydrarpc_dedicated_coherent.restore.runscript"
 RESTORE_AUTORUN_CMD_FILE="$OUTDIR/hydrarpc_dedicated_coherent.restore.autorun.sh"
+RESTORE_SERIAL_CMD_FILE=""
+SERIAL_TRANSCRIPT_PATH=""
+RESTORE_DEBUG_START_NAME="hydrarpc_dedicated_coherent.restore.started"
+RESTORE_DEBUG_RC_NAME="hydrarpc_dedicated_coherent.restore.rc"
+RESTORE_DEBUG_LOG_NAME="hydrarpc_dedicated_coherent.restore.debug.log"
+RESTORE_DEBUG_START_PATH="$OUTDIR/$RESTORE_DEBUG_START_NAME"
+RESTORE_DEBUG_RC_PATH="$OUTDIR/$RESTORE_DEBUG_RC_NAME"
+RESTORE_DEBUG_LOG_PATH="$OUTDIR/$RESTORE_DEBUG_LOG_NAME"
 
 {
   printf "#!/bin/sh\n"
@@ -375,32 +387,78 @@ RESTORE_AUTORUN_CMD_FILE="$OUTDIR/hydrarpc_dedicated_coherent.restore.autorun.sh
   printf "#!/bin/sh\n"
   printf "set -eu\n"
   printf "exec >/dev/ttyS0 2>&1\n"
+  printf "RESTORE_DEBUG_START=/tmp/%s\n" "$RESTORE_DEBUG_START_NAME"
+  printf "RESTORE_DEBUG_RC=/tmp/%s\n" "$RESTORE_DEBUG_RC_NAME"
+  printf "RESTORE_DEBUG_LOG=/tmp/%s\n" "$RESTORE_DEBUG_LOG_NAME"
+  printf "rm -f \"\$RESTORE_DEBUG_START\" \"\$RESTORE_DEBUG_RC\" \"\$RESTORE_DEBUG_LOG\"\n"
   printf "printf 'guest_restore_workload_start\\n'\n"
+  printf "printf 'started\\n' >\"\$RESTORE_DEBUG_START\"\n"
+  printf "/sbin/m5 writefile \"\$RESTORE_DEBUG_START\" \"%s\" || true\n" "$RESTORE_DEBUG_START_NAME"
   printf "printf 'guest_restore_workload_before_cmd\\n'\n"
   printf "set +e\n"
-  printf "%s\n" "$GUEST_CMD"
+  printf "{ %s; } >\"\$RESTORE_DEBUG_LOG\" 2>&1\n" "$GUEST_CMD"
   printf "rc=\$?\n"
+  printf "printf '%%s\\n' \"\$rc\" >\"\$RESTORE_DEBUG_RC\"\n"
+  printf "/sbin/m5 writefile \"\$RESTORE_DEBUG_LOG\" \"%s\" || true\n" "$RESTORE_DEBUG_LOG_NAME"
+  printf "/sbin/m5 writefile \"\$RESTORE_DEBUG_RC\" \"%s\" || true\n" "$RESTORE_DEBUG_RC_NAME"
   printf "printf 'guest_restore_workload_after_cmd rc=%%s\\n' \"\$rc\"\n"
   printf "printf 'guest_command_rc=%%s\\\\n' \"\$rc\"\n"
   printf "/sbin/m5 exit\n"
 } > "$RESTORE_WORKLOAD_FILE"
 
-{
-  printf "#!/bin/sh\n"
-  printf "set -eu\n"
-  printf "printf 'guest_restore_cmd_start\\n'\n"
-  printf "sync\n"
-  printf "echo 3 > /proc/sys/vm/drop_caches || true\n"
-  printf "set +e\n"
-  printf "%s\n" "$GUEST_RESTORE_CMD"
-  printf "rc=\$?\n"
-  printf "printf 'guest_restore_cmd_after_run rc=%%s\\\\n' \"\$rc\"\n"
-  printf "printf 'guest_restore_cmd_rc=%%s\\\\n' \"\$rc\"\n"
-  printf "printf 'guest_command_rc=%%s\\\\n' \"\$rc\"\n"
-  printf "/sbin/m5 exit\n"
-} > "$RESTORE_AUTORUN_CMD_FILE"
+chmod 755 "$WORKLOAD_FILE" "$RESTORE_WORKLOAD_FILE"
 
-chmod 755 "$WORKLOAD_FILE" "$RESTORE_WORKLOAD_FILE" "$RESTORE_AUTORUN_CMD_FILE"
+if [[ "$RESTORE_DISPATCH" == "guest-file" ]]; then
+  {
+    printf "#!/bin/sh\n"
+    printf "set -eu\n"
+    printf "RESTORE_DEBUG_START=/tmp/%s\n" "$RESTORE_DEBUG_START_NAME"
+    printf "RESTORE_DEBUG_RC=/tmp/%s\n" "$RESTORE_DEBUG_RC_NAME"
+    printf "RESTORE_DEBUG_LOG=/tmp/%s\n" "$RESTORE_DEBUG_LOG_NAME"
+    printf "rm -f \"\$RESTORE_DEBUG_START\" \"\$RESTORE_DEBUG_RC\" \"\$RESTORE_DEBUG_LOG\"\n"
+    printf "printf 'guest_restore_cmd_start\\n'\n"
+    printf "printf 'started\\n' >\"\$RESTORE_DEBUG_START\"\n"
+    printf "/sbin/m5 writefile \"\$RESTORE_DEBUG_START\" \"%s\" || true\n" "$RESTORE_DEBUG_START_NAME"
+    printf "sync\n"
+    printf "echo 3 > /proc/sys/vm/drop_caches || true\n"
+    printf "set +e\n"
+    printf "{ %s; } >\"\$RESTORE_DEBUG_LOG\" 2>&1\n" "$GUEST_RESTORE_CMD"
+    printf "rc=\$?\n"
+    printf "printf '%%s\\n' \"\$rc\" >\"\$RESTORE_DEBUG_RC\"\n"
+    printf "/sbin/m5 writefile \"\$RESTORE_DEBUG_LOG\" \"%s\" || true\n" "$RESTORE_DEBUG_LOG_NAME"
+    printf "/sbin/m5 writefile \"\$RESTORE_DEBUG_RC\" \"%s\" || true\n" "$RESTORE_DEBUG_RC_NAME"
+    printf "printf 'guest_restore_cmd_after_run rc=%%s\\\\n' \"\$rc\"\n"
+    printf "printf 'guest_restore_cmd_rc=%%s\\\\n' \"\$rc\"\n"
+    printf "printf 'guest_command_rc=%%s\\\\n' \"\$rc\"\n"
+    printf "/sbin/m5 exit\n"
+  } > "$RESTORE_AUTORUN_CMD_FILE"
+
+  chmod 755 "$RESTORE_AUTORUN_CMD_FILE"
+elif [[ "$RESTORE_DISPATCH" == "guest-shell" ]]; then
+  RESTORE_SERIAL_CMD_FILE="$OUTDIR/hydrarpc_dedicated_coherent.restore.serial.cmd"
+  SERIAL_TRANSCRIPT_PATH="$OUTDIR/ttyS0.transcript"
+
+  {
+    printf "RESTORE_DEBUG_START=/tmp/%s\n" "$RESTORE_DEBUG_START_NAME"
+    printf "RESTORE_DEBUG_RC=/tmp/%s\n" "$RESTORE_DEBUG_RC_NAME"
+    printf "RESTORE_DEBUG_LOG=/tmp/%s\n" "$RESTORE_DEBUG_LOG_NAME"
+    printf "rm -f \"\$RESTORE_DEBUG_START\" \"\$RESTORE_DEBUG_RC\" \"\$RESTORE_DEBUG_LOG\"\n"
+    printf "printf 'guest_restore_serial_start\\n'\n"
+    printf "printf 'started\\n' >\"\$RESTORE_DEBUG_START\"\n"
+    printf "/sbin/m5 writefile \"\$RESTORE_DEBUG_START\" \"%s\" || true\n" "$RESTORE_DEBUG_START_NAME"
+    printf "sync\n"
+    printf "echo 3 > /proc/sys/vm/drop_caches || true\n"
+    printf "set +e\n"
+    printf "{ %s; } >\"\$RESTORE_DEBUG_LOG\" 2>&1\n" "$GUEST_CMD"
+    printf "rc=\$?\n"
+    printf "printf '%%s\\n' \"\$rc\" >\"\$RESTORE_DEBUG_RC\"\n"
+    printf "/sbin/m5 writefile \"\$RESTORE_DEBUG_LOG\" \"%s\" || true\n" "$RESTORE_DEBUG_LOG_NAME"
+    printf "/sbin/m5 writefile \"\$RESTORE_DEBUG_RC\" \"%s\" || true\n" "$RESTORE_DEBUG_RC_NAME"
+    printf "printf 'guest_restore_serial_after_cmd rc=%%s\\n' \"\$rc\"\n"
+    printf "printf 'guest_command_rc=%%s\\\\n' \"\$rc\"\n"
+    printf "/sbin/m5 exit\n"
+  } > "$RESTORE_SERIAL_CMD_FILE"
+fi
 
 prepare_guest_file_restore_image() {
   local image_copy="$OUTDIR/parsec.img"
@@ -459,6 +517,11 @@ if [[ -n "$RESTORE_CHECKPOINT" ]]; then
       --restore-checkpoint "$RESTORE_CHECKPOINT"
       --disable-workload
     )
+  elif [[ "$RESTORE_DISPATCH" == "guest-shell" ]]; then
+    gem5_args+=(
+      --restore-checkpoint "$RESTORE_CHECKPOINT"
+      --disable-workload
+    )
   else
     gem5_args+=(
       --restore-checkpoint "$RESTORE_CHECKPOINT"
@@ -472,7 +535,49 @@ else
   )
 fi
 
-if ! "${gem5_launcher[@]}" "${gem5_args[@]}" >"$GEM5_LOG" 2>&1; then
+run_gem5_with_serial_restore() {
+  local gem5_pid=""
+  local gem5_rc=0
+
+  : >"$SERIAL_TRANSCRIPT_PATH"
+
+  "${gem5_launcher[@]}" "${gem5_args[@]}" >"$GEM5_LOG" 2>&1 &
+  gem5_pid=$!
+
+  if ! python3 tools/drive_guest_serial.py \
+    --port "$TERMINAL_PORT" \
+    --command-file "$RESTORE_SERIAL_CMD_FILE" \
+    --transcript "$SERIAL_TRANSCRIPT_PATH" \
+    --shell-timeout 240 \
+    --disconnect-timeout 7200; then
+    kill "$gem5_pid" 2>/dev/null || true
+    wait "$gem5_pid" 2>/dev/null || true
+    echo "guest-shell restore command failed" >&2
+    echo "=== ttyS0 transcript tail ===" >&2
+    tail -n 120 "$SERIAL_TRANSCRIPT_PATH" >&2 || true
+    echo "=== gem5 log tail ===" >&2
+    tail -n 200 "$GEM5_LOG" >&2 || true
+    exit 1
+  fi
+
+  set +e
+  wait "$gem5_pid"
+  gem5_rc=$?
+  set -e
+
+  if [[ "$gem5_rc" -ne 0 ]]; then
+    echo "gem5 run failed" >&2
+    echo "=== ttyS0 transcript tail ===" >&2
+    tail -n 120 "$SERIAL_TRANSCRIPT_PATH" >&2 || true
+    echo "=== gem5 log tail ===" >&2
+    tail -n 200 "$GEM5_LOG" >&2 || true
+    exit 1
+  fi
+}
+
+if [[ "$RESTORE_DISPATCH" == "guest-shell" ]]; then
+  run_gem5_with_serial_restore
+elif ! "${gem5_launcher[@]}" "${gem5_args[@]}" >"$GEM5_LOG" 2>&1; then
   echo "gem5 run failed" >&2
   echo "=== gem5 log ===" >&2
   tail -n 200 "$GEM5_LOG" >&2 || true
@@ -483,6 +588,22 @@ if [[ ! -f "$RESULT_LOG_PATH" ]]; then
   echo "missing result log: $RESULT_LOG_PATH" >&2
   echo "=== board log tail ===" >&2
   tail -n 80 "$LOG_PATH" >&2 || true
+  if [[ -f "$RESTORE_DEBUG_START_PATH" ]]; then
+    echo "=== restore started marker ===" >&2
+    cat "$RESTORE_DEBUG_START_PATH" >&2 || true
+  fi
+  if [[ -f "$RESTORE_DEBUG_RC_PATH" ]]; then
+    echo "=== restore rc ===" >&2
+    cat "$RESTORE_DEBUG_RC_PATH" >&2 || true
+  fi
+  if [[ -f "$RESTORE_DEBUG_LOG_PATH" ]]; then
+    echo "=== restore debug log tail ===" >&2
+    tail -n 120 "$RESTORE_DEBUG_LOG_PATH" >&2 || true
+  fi
+  if [[ -f "$SERIAL_TRANSCRIPT_PATH" ]]; then
+    echo "=== ttyS0 transcript tail ===" >&2
+    tail -n 120 "$SERIAL_TRANSCRIPT_PATH" >&2 || true
+  fi
   echo "=== gem5 log tail ===" >&2
   tail -n 80 "$GEM5_LOG" >&2 || true
   exit 1

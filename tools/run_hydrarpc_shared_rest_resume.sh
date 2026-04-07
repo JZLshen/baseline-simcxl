@@ -42,7 +42,7 @@ Included case groups:
   - sensitivity req-size
   - sensitivity resp-size
   - sensitivity ring-size
-  - sensitivity sparse32
+  - sensitivity sparse16
   - sensitivity cxl-latency
   - application
 EOF
@@ -73,7 +73,7 @@ SKIP_EXISTING=0
 CONTINUE_ON_FAILURE=0
 ANY_FAILURES=0
 
-APP_PROFILES="ycsb_a_1k ycsb_b_1k ycsb_c_1k ycsb_f_1k udb_ro"
+APP_PROFILES="ycsb_a_1k ycsb_b_1k ycsb_c_1k ycsb_d_1k udb_a udb_b udb_c udb_d"
 APP_CLIENT_COUNT=32
 APP_RECORD_COUNT=10000
 APP_DATASET_SEED="0x9B5D3A4781C26EF1"
@@ -390,10 +390,20 @@ build_case_manifest() {
       32 64 64 - - - - "$ring_size"
   done
 
-  for slow_count_per_client in 8 15; do
-    for slow_client_count in 4 8 16 20 24 28; do
-      queue_micro_case "sensitivity/sparse32_sc${slow_client_count}_sq${slow_count_per_client}" \
-        32 64 64 - - - - "$SLOT_COUNT" \
+  for slow_count_per_client in 0 8 15; do
+    local slow_request_pct=""
+    case "$slow_count_per_client" in
+      0) slow_request_pct=0 ;;
+      8) slow_request_pct=25 ;;
+      15) slow_request_pct=50 ;;
+      *)
+        echo "unsupported slow_count_per_client: $slow_count_per_client" >&2
+        exit 1
+        ;;
+    esac
+    for slow_client_count in 1 2 4 8; do
+      queue_micro_case "sensitivity/sparse16_d${slow_request_pct}_c${slow_client_count}" \
+        16 38 230 19 57 115 345 "$SLOT_COUNT" \
         "$slow_client_count" "$slow_count_per_client" 20000
     done
   done

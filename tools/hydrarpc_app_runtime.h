@@ -23,6 +23,7 @@ typedef struct {
 typedef struct {
     const char *profile_name;
     size_t record_count;
+    size_t preload_count;
     size_t key_size;
     size_t value_size;
     size_t max_key_size;
@@ -37,6 +38,7 @@ typedef struct {
 } hydrarpc_app_store_t;
 
 #define HYDRARPC_APPRT_FIXED_UNIFORM_PLAN_LEN 30u
+#define HYDRARPC_APPRT_LATEST_WINDOW 64u
 
 static inline uint64_t
 hydrarpc_apprt_next_random_u64(uint64_t *state)
@@ -121,6 +123,89 @@ hydrarpc_apprt_sample_uniform_key_id(uint64_t record_count, uint64_t *rng_state,
         return -1;
 
     *out_key_id = hydrarpc_apprt_next_random_u64(rng_state) % record_count;
+    return 0;
+}
+
+static int
+hydrarpc_apprt_uses_latest_plan(hydrarpc_app_key_dist_t key_dist)
+{
+    return key_dist == HYDRARPC_APP_KEY_DIST_LATEST;
+}
+
+static uint64_t
+hydrarpc_apprt_total_insert_count(uint64_t total_request_count,
+                                  double insert_ratio)
+{
+    long long rounded = 0;
+
+    if (total_request_count == 0 || insert_ratio <= 0.0)
+        return 0;
+
+    rounded = llround(insert_ratio * (double)total_request_count);
+    if (rounded <= 0)
+        return 0;
+    if ((uint64_t)rounded > total_request_count)
+        return total_request_count;
+    return (uint64_t)rounded;
+}
+
+static uint64_t
+hydrarpc_apprt_insert_count_before(uint64_t global_slot,
+                                   uint64_t total_request_count,
+                                   uint64_t total_insert_count)
+{
+    if (total_request_count == 0 || total_insert_count == 0)
+        return 0;
+
+    return (global_slot * total_insert_count) / total_request_count;
+}
+
+static int
+hydrarpc_apprt_is_insert_slot(uint64_t global_slot,
+                              uint64_t total_request_count,
+                              uint64_t total_insert_count)
+{
+    uint64_t before = 0;
+    uint64_t after = 0;
+
+    if (total_request_count == 0 || total_insert_count == 0)
+        return 0;
+
+    before = hydrarpc_apprt_insert_count_before(global_slot,
+                                                total_request_count,
+                                                total_insert_count);
+    after = ((global_slot + 1u) * total_insert_count) / total_request_count;
+    return after > before;
+}
+
+static int
+hydrarpc_apprt_sample_latest_key_id(uint64_t preload_count,
+                                    uint64_t inserted_count,
+                                    uint64_t *rng_state,
+                                    uint64_t *out_key_id)
+{
+    uint64_t newest_key_id = 0;
+    uint64_t latest_span = 0;
+    uint64_t offset = 0;
+
+    if (!out_key_id)
+        return -1;
+
+    if (inserted_count > 0) {
+        newest_key_id = preload_count + inserted_count - 1u;
+        latest_span = inserted_count;
+    } else if (preload_count > 0) {
+        newest_key_id = preload_count - 1u;
+        latest_span = preload_count;
+    } else {
+        return -1;
+    }
+
+    if (latest_span > HYDRARPC_APPRT_LATEST_WINDOW)
+        latest_span = HYDRARPC_APPRT_LATEST_WINDOW;
+
+    offset = hydrarpc_apprt_next_random_u64(rng_state) % latest_span;
+    *out_key_id = newest_key_id - offset;
     return 0;
 }
 
@@ -223,6 +308,8 @@ hydrarpc_apprt_build_operations(hydrarpc_app_operation_t *ops,
                                 uint64_t num_requests,
                                 const char *profile_name,
                                 uint64_t record_count,
+                                uint64_t client_count,
+                                uint64_t request_count_per_client,
                                 uint64_t client_id,
                                 size_t key_size,
                                 size_t value_size,
@@ -230,6 +317,7 @@ hydrarpc_apprt_build_operations(hydrarpc_app_operation_t *ops,
                                 double read_ratio,
                                 double update_ratio,
                                 double rmw_ratio,
+                                double insert_ratio,
                                 hydrarpc_app_key_dist_t key_dist,
                                 double zipf_theta,
                                 uint64_t dataset_seed,
@@ -238,6 +326,10 @@ hydrarpc_apprt_build_operations(hydrarpc_app_operation_t *ops,
     double *cdf = NULL;
     uint8_t *key_buf = NULL;
     uint64_t rng_state = workload_seed;
+    uint64_t total_request_count = client_count * request_count_per_client;
+    uint64_t total_insert_count =
+        hydrarpc_apprt_total_insert_count(total_request_count, insert_ratio);
+    uint64_t preload_count = record_count;
     uint64_t req_index = 0;
 
     if (!ops || !profile_name || num_requests == 0 || record_count == 0 ||
@@ -245,7 +337,19 @@ hydrarpc_apprt_build_operations(hydrarpc_app_operation_t *ops,
         return -1;
     }
     if (read_ratio < 0.0 || update_ratio < 0.0 || rmw_ratio < 0.0 ||
-        fabs((read_ratio + update_ratio + rmw_ratio) - 1.0) > 1e-6) {
+        insert_ratio < 0.0 ||
+        fabs((read_ratio + update_ratio + rmw_ratio + insert_ratio) - 1.0) >
+            1e-6) {
+        return -1;
+    }
+    if (hydrarpc_apprt_uses_latest_plan(key_dist)) {
+        if (total_request_count == 0 || total_insert_count == 0 ||
+            total_insert_count >= record_count) {
+            return -1;
+        }
+        preload_count = record_count - total_insert_count;
+    }
+    if (key_dist == HYDRARPC_APP_KEY_DIST_ZIPF && zipf_theta <= 0.0) {
         return -1;
     }
 
@@ -266,7 +370,26 @@ hydrarpc_apprt_build_operations(hydrarpc_app_operation_t *ops,
         uint64_t key_hash = 0;
         double selector = 0.0;
 
-        if (hydrarpc_apprt_uses_fixed_uniform_plan(profile_name, key_dist)) {
+        if (hydrarpc_apprt_uses_latest_plan(key_dist)) {
+            uint64_t global_slot = req_index * client_count + client_id;
+            uint64_t inserts_before =
+                hydrarpc_apprt_insert_count_before(global_slot,
+                                                   total_request_count,
+                                                   total_insert_count);
+
+            if (hydrarpc_apprt_is_insert_slot(global_slot,
+                                              total_request_count,
+                                              total_insert_count)) {
+                key_id = preload_count + inserts_before;
+            } else if (hydrarpc_apprt_sample_latest_key_id(preload_count,
+                                                           inserts_before,
+                                                           &rng_state,
+                                                           &key_id) != 0) {
+                free(cdf);
+                free(key_buf);
+                return -1;
+            }
+        } else if (hydrarpc_apprt_uses_fixed_uniform_plan(profile_name, key_dist)) {
             uint64_t plan_slot = hydrarpc_apprt_fixed_uniform_plan_slot(client_id,
                                                                         req_index);
 
@@ -311,7 +434,17 @@ hydrarpc_apprt_build_operations(hydrarpc_app_operation_t *ops,
         key_hash = hydrarpc_app_hash_bytes(key_buf, record_key_len);
         selector = hydrarpc_apprt_next_random_double(&rng_state);
 
-        if (selector < read_ratio) {
+        if (hydrarpc_apprt_uses_latest_plan(key_dist)) {
+            uint64_t global_slot = req_index * client_count + client_id;
+
+            if (hydrarpc_apprt_is_insert_slot(global_slot,
+                                              total_request_count,
+                                              total_insert_count)) {
+                ops[req_index].op = HYDRARPC_APP_OP_INSERT;
+            } else {
+                ops[req_index].op = HYDRARPC_APP_OP_GET;
+            }
+        } else if (selector < read_ratio) {
             ops[req_index].op = HYDRARPC_APP_OP_GET;
         } else if (selector < (read_ratio + update_ratio)) {
             ops[req_index].op = HYDRARPC_APP_OP_PUT;
@@ -373,7 +506,8 @@ hydrarpc_apprt_encode_request(uint8_t *dst, size_t dst_size,
     req_len = hydrarpc_app_request_wire_size(
         op->op,
         op->key_len,
-        ((op->op == HYDRARPC_APP_OP_PUT || op->op == HYDRARPC_APP_OP_RMW) ?
+        ((op->op == HYDRARPC_APP_OP_PUT || op->op == HYDRARPC_APP_OP_RMW ||
+          op->op == HYDRARPC_APP_OP_INSERT) ?
              op->value_len :
              0u));
     if (req_len > dst_size)
@@ -386,7 +520,10 @@ hydrarpc_apprt_encode_request(uint8_t *dst, size_t dst_size,
     hdr->reserved0 = 0;
     hdr->value_len =
         (uint32_t)(((op->op == HYDRARPC_APP_OP_PUT ||
-                     op->op == HYDRARPC_APP_OP_RMW) ? op->value_len : 0u));
+                     op->op == HYDRARPC_APP_OP_RMW ||
+                     op->op == HYDRARPC_APP_OP_INSERT) ?
+                        op->value_len :
+                        0u));
     hdr->key_hash = op->key_hash;
 
     key_ptr = (uint8_t *)(hdr + 1);
@@ -399,7 +536,8 @@ hydrarpc_apprt_encode_request(uint8_t *dst, size_t dst_size,
     } else {
         hydrarpc_app_fill_key(key_ptr, op->key_len, dataset_seed, op->key_id);
     }
-    if (op->op == HYDRARPC_APP_OP_PUT || op->op == HYDRARPC_APP_OP_RMW) {
+    if (op->op == HYDRARPC_APP_OP_PUT || op->op == HYDRARPC_APP_OP_RMW ||
+        op->op == HYDRARPC_APP_OP_INSERT) {
         hydrarpc_app_fill_value(key_ptr + op->key_len,
                                 op->value_len,
                                 op->value_seed);
@@ -449,13 +587,15 @@ static int
 hydrarpc_apprt_store_init(hydrarpc_app_store_t *store,
                           const char *profile_name,
                           size_t record_count,
+                          size_t preload_count,
                           size_t key_size,
                           size_t value_size,
                           size_t max_key_size,
                           size_t max_value_size,
                           uint64_t dataset_seed)
 {
-    if (!store || !profile_name || record_count == 0 || key_size == 0 ||
+    if (!store || !profile_name || record_count == 0 || preload_count == 0 ||
+        preload_count > record_count || key_size == 0 ||
         value_size == 0 || max_key_size == 0 || max_value_size == 0) {
         return -1;
     }
@@ -463,20 +603,21 @@ hydrarpc_apprt_store_init(hydrarpc_app_store_t *store,
     memset(store, 0, sizeof(*store));
     store->profile_name = profile_name;
     store->record_count = record_count;
+    store->preload_count = preload_count;
     store->key_size = key_size;
     store->value_size = value_size;
     store->max_key_size = max_key_size;
     store->max_value_size = max_value_size;
     store->dataset_seed = dataset_seed;
-    store->keys = (uint8_t *)malloc(record_count * max_key_size);
-    store->values = (uint8_t *)malloc(record_count * max_value_size);
+    store->keys = (uint8_t *)calloc(record_count, max_key_size);
+    store->values = (uint8_t *)calloc(record_count, max_value_size);
     store->key_lengths =
-        (uint16_t *)malloc(record_count * sizeof(*store->key_lengths));
+        (uint16_t *)calloc(record_count, sizeof(*store->key_lengths));
     store->value_lengths =
-        (uint32_t *)malloc(record_count * sizeof(*store->value_lengths));
-    store->hashes = (uint64_t *)malloc(record_count * sizeof(*store->hashes));
+        (uint32_t *)calloc(record_count, sizeof(*store->value_lengths));
+    store->hashes = (uint64_t *)calloc(record_count, sizeof(*store->hashes));
     store->checksums =
-        (uint64_t *)malloc(record_count * sizeof(*store->checksums));
+        (uint64_t *)calloc(record_count, sizeof(*store->checksums));
     if (!store->keys || !store->values || !store->key_lengths ||
         !store->value_lengths || !store->hashes || !store->checksums) {
         return -1;
@@ -510,7 +651,7 @@ hydrarpc_apprt_store_preload(hydrarpc_app_store_t *store)
         return -1;
     }
 
-    for (record_index = 0; record_index < store->record_count; record_index++) {
+    for (record_index = 0; record_index < store->preload_count; record_index++) {
         size_t key_len = 0;
         size_t value_len = 0;
         uint8_t *key = store->keys + (record_index * store->max_key_size);
@@ -545,6 +686,38 @@ hydrarpc_apprt_store_preload(hydrarpc_app_store_t *store)
             hydrarpc_app_checksum_bytes(value, value_len);
     }
 
+    return 0;
+}
+
+static int
+hydrarpc_apprt_store_insert_value(hydrarpc_app_store_t *store,
+                                  uint32_t record_index,
+                                  const uint8_t *key,
+                                  size_t key_len,
+                                  uint64_t key_hash,
+                                  const uint8_t *value,
+                                  size_t value_len)
+{
+    uint8_t *dst_key = NULL;
+    uint8_t *dst_value = NULL;
+
+    if (!store || !key || !value || record_index >= store->record_count ||
+        key_len == 0 || key_len > store->max_key_size ||
+        value_len == 0 || value_len > store->max_value_size ||
+        store->key_lengths[record_index] != 0 ||
+        store->value_lengths[record_index] != 0) {
+        return -1;
+    }
+
+    dst_key = store->keys + ((size_t)record_index * store->max_key_size);
+    dst_value = store->values + ((size_t)record_index * store->max_value_size);
+    memcpy(dst_key, key, key_len);
+    memcpy(dst_value, value, value_len);
+    store->key_lengths[record_index] = (uint16_t)key_len;
+    store->value_lengths[record_index] = (uint32_t)value_len;
+    store->hashes[record_index] = key_hash;
+    store->checksums[record_index] =
+        hydrarpc_app_checksum_bytes(dst_value, value_len);
     return 0;
 }
 
@@ -629,14 +802,16 @@ hydrarpc_apprt_store_process_request(hydrarpc_app_store_t *store,
     if (req_hdr->key_len == 0 || req_hdr->key_len > store->max_key_size ||
         (req_hdr->op != HYDRARPC_APP_OP_GET &&
          req_hdr->op != HYDRARPC_APP_OP_PUT &&
-         req_hdr->op != HYDRARPC_APP_OP_RMW) ||
+         req_hdr->op != HYDRARPC_APP_OP_RMW &&
+         req_hdr->op != HYDRARPC_APP_OP_INSERT) ||
         hydrarpc_app_request_wire_size(req_hdr->op,
                                        req_hdr->key_len,
                                        req_hdr->value_len) != request_len) {
         return -1;
     }
     if ((req_hdr->op == HYDRARPC_APP_OP_PUT ||
-         req_hdr->op == HYDRARPC_APP_OP_RMW) &&
+         req_hdr->op == HYDRARPC_APP_OP_RMW ||
+         req_hdr->op == HYDRARPC_APP_OP_INSERT) &&
         (req_hdr->value_len == 0 || req_hdr->value_len > store->max_value_size)) {
         return -1;
     }
@@ -694,6 +869,24 @@ hydrarpc_apprt_store_process_request(hydrarpc_app_store_t *store,
                                               req_hdr->value_len) != 0) {
             return -1;
         }
+    } else if (!found && req_hdr->op == HYDRARPC_APP_OP_INSERT) {
+        uint64_t key_id = 0;
+
+        if (req_hdr->key_len < sizeof(uint64_t))
+            return -1;
+        memcpy(&key_id, key_ptr, sizeof(key_id));
+        if (key_id >= store->record_count)
+            return -1;
+        if (hydrarpc_apprt_store_insert_value(store,
+                                              (uint32_t)key_id,
+                                              key_ptr,
+                                              req_hdr->key_len,
+                                              req_hdr->key_hash,
+                                              value_ptr,
+                                              req_hdr->value_len) != 0) {
+            return -1;
+        }
+        resp_hdr->status = HYDRARPC_APP_STATUS_OK;
     }
 
     response_len = hydrarpc_app_response_wire_size(resp_hdr->status,

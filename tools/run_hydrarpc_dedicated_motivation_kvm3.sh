@@ -28,8 +28,8 @@ Options:
 
 Shard layout:
   machine 1: coherent staging pow2 + dedicated response-size motivation
-  machine 2: non-coherent staging pow2 + half of sparse32
-  machine 3: non-coherent direct pow2 + half of sparse32
+  machine 2: non-coherent staging pow2 + half of sparse16
+  machine 3: non-coherent direct pow2 + half of sparse16
 
 All runs use num-cpus=34 by default so each machine can reuse one Classic
 checkpoint and, when needed, one Ruby checkpoint.
@@ -39,7 +39,7 @@ EOF
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export DISK_IMAGE="${DISK_IMAGE:-${REPO_ROOT}/files/parsec.img}"
-CC_CHECKPOINT_BOOT_SCRIPT="${REPO_ROOT}/configs/boot/hack_back_ckpt_exec_guest_autorun.rcS"
+CC_CHECKPOINT_BOOT_SCRIPT="${REPO_ROOT}/configs/boot/hack_back_ckpt_exec_guest_readfile_helper_coherent.rcS"
 
 MACHINE_INDEX=""
 ROOT_OUTDIR=""
@@ -182,7 +182,7 @@ append_common_cc_args() {
     --boot-cpu "$BOOT_CPU"
     --num-cpus "$NUM_CPUS"
     --restore-checkpoint "$(checkpoint_path ruby)"
-    --restore-dispatch guest-file
+    --restore-dispatch readfile
     --skip-build
     --skip-image-setup
   )
@@ -253,15 +253,16 @@ run_noncc_pow2() {
 run_sparse_batch() {
   local -n points_ref=$1
   local pair=""
+  local pct=""
   local sc=""
   local sq=""
 
   for pair in "${points_ref[@]}"; do
-    read -r sc sq <<<"$pair"
+    read -r pct sc sq <<<"$pair"
     run_noncc_single \
-      "$ROOT_OUTDIR/sparse32_sc${sc}_sq${sq}" \
+      "$ROOT_OUTDIR/sparse16_d${pct}_c${sc}" \
       --kinds dedicated \
-      --client-counts "32" \
+      --client-counts "16" \
       --req-bytes 64 \
       --resp-bytes 64 \
       --slow-client-count "$sc" \
@@ -299,6 +300,7 @@ run_respsize_batch() {
 
 run_machine1() {
   ensure_dedicated_image
+  ensure_coherent_image
   ensure_checkpoint classic
   ensure_checkpoint ruby "$CC_CHECKPOINT_BOOT_SCRIPT"
 
@@ -308,15 +310,12 @@ run_machine1() {
 
 run_machine2() {
   local sparse_points=(
-    "4 30"
-    "16 30"
-    "24 30"
-    "4 15"
-    "8 8"
-    "16 15"
-    "24 15"
-    "20 8"
-    "28 8"
+    "0 1 0"
+    "0 4 0"
+    "25 1 8"
+    "25 4 8"
+    "50 1 15"
+    "50 4 15"
   )
 
   ensure_dedicated_image
@@ -331,15 +330,12 @@ run_machine2() {
 
 run_machine3() {
   local sparse_points=(
-    "8 30"
-    "20 30"
-    "28 30"
-    "4 8"
-    "8 15"
-    "20 15"
-    "16 8"
-    "28 15"
-    "24 8"
+    "0 2 0"
+    "0 8 0"
+    "25 2 8"
+    "25 8 8"
+    "50 2 15"
+    "50 8 15"
   )
 
   ensure_dedicated_image

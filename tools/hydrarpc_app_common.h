@@ -8,8 +8,11 @@
 #define HYDRARPC_APP_PROFILE_YCSB_A_1K "ycsb_a_1k"
 #define HYDRARPC_APP_PROFILE_YCSB_B_1K "ycsb_b_1k"
 #define HYDRARPC_APP_PROFILE_YCSB_C_1K "ycsb_c_1k"
-#define HYDRARPC_APP_PROFILE_YCSB_F_1K "ycsb_f_1k"
-#define HYDRARPC_APP_PROFILE_UDB_RO "udb_ro"
+#define HYDRARPC_APP_PROFILE_YCSB_D_1K "ycsb_d_1k"
+#define HYDRARPC_APP_PROFILE_UDB_A "udb_a"
+#define HYDRARPC_APP_PROFILE_UDB_B "udb_b"
+#define HYDRARPC_APP_PROFILE_UDB_C "udb_c"
+#define HYDRARPC_APP_PROFILE_UDB_D "udb_d"
 
 #define HYDRARPC_APP_DEFAULT_RECORD_COUNT 10000ULL
 #define HYDRARPC_APP_DEFAULT_DATASET_SEED 0x9B5D3A4781C26EF1ULL
@@ -27,6 +30,7 @@
 #define HYDRARPC_APP_OP_GET 1u
 #define HYDRARPC_APP_OP_PUT 2u
 #define HYDRARPC_APP_OP_RMW 3u
+#define HYDRARPC_APP_OP_INSERT 4u
 
 #define HYDRARPC_APP_STATUS_OK 0u
 #define HYDRARPC_APP_STATUS_MISS 1u
@@ -35,6 +39,7 @@
 typedef enum {
     HYDRARPC_APP_KEY_DIST_UNIFORM = 0,
     HYDRARPC_APP_KEY_DIST_ZIPF = 1,
+    HYDRARPC_APP_KEY_DIST_LATEST = 2,
 } hydrarpc_app_key_dist_t;
 
 typedef struct {
@@ -44,6 +49,7 @@ typedef struct {
     double read_ratio;
     double update_ratio;
     double rmw_ratio;
+    double insert_ratio;
     hydrarpc_app_key_dist_t key_dist;
     double zipf_theta;
 } hydrarpc_app_profile_t;
@@ -177,7 +183,8 @@ static inline size_t
 hydrarpc_app_request_wire_size(uint8_t op, size_t key_len, size_t value_len)
 {
     return sizeof(hydrarpc_app_request_hdr_t) + key_len +
-           ((op == HYDRARPC_APP_OP_PUT || op == HYDRARPC_APP_OP_RMW) ?
+           ((op == HYDRARPC_APP_OP_PUT || op == HYDRARPC_APP_OP_RMW ||
+             op == HYDRARPC_APP_OP_INSERT) ?
                 value_len :
                 0u);
 }
@@ -192,9 +199,19 @@ hydrarpc_app_response_wire_size(uint8_t status, uint8_t op, size_t value_len)
 }
 
 static inline int
+hydrarpc_app_profile_uses_udb_layout(const char *name)
+{
+    return name &&
+           (strcmp(name, HYDRARPC_APP_PROFILE_UDB_A) == 0 ||
+            strcmp(name, HYDRARPC_APP_PROFILE_UDB_B) == 0 ||
+            strcmp(name, HYDRARPC_APP_PROFILE_UDB_C) == 0 ||
+            strcmp(name, HYDRARPC_APP_PROFILE_UDB_D) == 0);
+}
+
+static inline int
 hydrarpc_app_profile_has_variable_layout(const char *name)
 {
-    return name && strcmp(name, HYDRARPC_APP_PROFILE_UDB_RO) == 0;
+    return hydrarpc_app_profile_uses_udb_layout(name);
 }
 
 static inline size_t
@@ -309,6 +326,7 @@ hydrarpc_app_lookup_profile(const char *name, hydrarpc_app_profile_t *out)
         profile.read_ratio = 0.5;
         profile.update_ratio = 0.5;
         profile.rmw_ratio = 0.0;
+        profile.insert_ratio = 0.0;
         profile.key_dist = HYDRARPC_APP_KEY_DIST_ZIPF;
         profile.zipf_theta = HYDRARPC_APP_DEFAULT_ZIPF_THETA;
     } else if (strcmp(name, HYDRARPC_APP_PROFILE_YCSB_B_1K) == 0) {
@@ -318,6 +336,7 @@ hydrarpc_app_lookup_profile(const char *name, hydrarpc_app_profile_t *out)
         profile.read_ratio = 0.95;
         profile.update_ratio = 0.05;
         profile.rmw_ratio = 0.0;
+        profile.insert_ratio = 0.0;
         profile.key_dist = HYDRARPC_APP_KEY_DIST_ZIPF;
         profile.zipf_theta = HYDRARPC_APP_DEFAULT_ZIPF_THETA;
     } else if (strcmp(name, HYDRARPC_APP_PROFILE_YCSB_C_1K) == 0) {
@@ -327,25 +346,58 @@ hydrarpc_app_lookup_profile(const char *name, hydrarpc_app_profile_t *out)
         profile.read_ratio = 1.0;
         profile.update_ratio = 0.0;
         profile.rmw_ratio = 0.0;
+        profile.insert_ratio = 0.0;
         profile.key_dist = HYDRARPC_APP_KEY_DIST_ZIPF;
         profile.zipf_theta = HYDRARPC_APP_DEFAULT_ZIPF_THETA;
-    } else if (strcmp(name, HYDRARPC_APP_PROFILE_YCSB_F_1K) == 0) {
-        profile.name = HYDRARPC_APP_PROFILE_YCSB_F_1K;
+    } else if (strcmp(name, HYDRARPC_APP_PROFILE_YCSB_D_1K) == 0) {
+        profile.name = HYDRARPC_APP_PROFILE_YCSB_D_1K;
         profile.key_size = HYDRARPC_APP_DEFAULT_YCSB_KEY_SIZE;
         profile.value_size = HYDRARPC_APP_DEFAULT_YCSB_VALUE_SIZE;
-        profile.read_ratio = 0.0;
+        profile.read_ratio = 0.95;
         profile.update_ratio = 0.0;
-        profile.rmw_ratio = 1.0;
+        profile.rmw_ratio = 0.0;
+        profile.insert_ratio = 0.05;
+        profile.key_dist = HYDRARPC_APP_KEY_DIST_LATEST;
+        profile.zipf_theta = 0.0;
+    } else if (strcmp(name, HYDRARPC_APP_PROFILE_UDB_A) == 0) {
+        profile.name = HYDRARPC_APP_PROFILE_UDB_A;
+        profile.key_size = HYDRARPC_APP_DEFAULT_UDB_KEY_SIZE;
+        profile.value_size = HYDRARPC_APP_DEFAULT_UDB_VALUE_SIZE;
+        profile.read_ratio = 0.5;
+        profile.update_ratio = 0.5;
+        profile.rmw_ratio = 0.0;
+        profile.insert_ratio = 0.0;
         profile.key_dist = HYDRARPC_APP_KEY_DIST_ZIPF;
         profile.zipf_theta = HYDRARPC_APP_DEFAULT_ZIPF_THETA;
-    } else if (strcmp(name, HYDRARPC_APP_PROFILE_UDB_RO) == 0) {
-        profile.name = HYDRARPC_APP_PROFILE_UDB_RO;
+    } else if (strcmp(name, HYDRARPC_APP_PROFILE_UDB_B) == 0) {
+        profile.name = HYDRARPC_APP_PROFILE_UDB_B;
+        profile.key_size = HYDRARPC_APP_DEFAULT_UDB_KEY_SIZE;
+        profile.value_size = HYDRARPC_APP_DEFAULT_UDB_VALUE_SIZE;
+        profile.read_ratio = 0.95;
+        profile.update_ratio = 0.05;
+        profile.rmw_ratio = 0.0;
+        profile.insert_ratio = 0.0;
+        profile.key_dist = HYDRARPC_APP_KEY_DIST_ZIPF;
+        profile.zipf_theta = HYDRARPC_APP_DEFAULT_ZIPF_THETA;
+    } else if (strcmp(name, HYDRARPC_APP_PROFILE_UDB_C) == 0) {
+        profile.name = HYDRARPC_APP_PROFILE_UDB_C;
         profile.key_size = HYDRARPC_APP_DEFAULT_UDB_KEY_SIZE;
         profile.value_size = HYDRARPC_APP_DEFAULT_UDB_VALUE_SIZE;
         profile.read_ratio = 1.0;
         profile.update_ratio = 0.0;
         profile.rmw_ratio = 0.0;
-        profile.key_dist = HYDRARPC_APP_KEY_DIST_UNIFORM;
+        profile.insert_ratio = 0.0;
+        profile.key_dist = HYDRARPC_APP_KEY_DIST_ZIPF;
+        profile.zipf_theta = HYDRARPC_APP_DEFAULT_ZIPF_THETA;
+    } else if (strcmp(name, HYDRARPC_APP_PROFILE_UDB_D) == 0) {
+        profile.name = HYDRARPC_APP_PROFILE_UDB_D;
+        profile.key_size = HYDRARPC_APP_DEFAULT_UDB_KEY_SIZE;
+        profile.value_size = HYDRARPC_APP_DEFAULT_UDB_VALUE_SIZE;
+        profile.read_ratio = 0.95;
+        profile.update_ratio = 0.0;
+        profile.rmw_ratio = 0.0;
+        profile.insert_ratio = 0.05;
+        profile.key_dist = HYDRARPC_APP_KEY_DIST_LATEST;
         profile.zipf_theta = 0.0;
     } else {
         return -1;

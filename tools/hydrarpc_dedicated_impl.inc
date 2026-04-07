@@ -63,6 +63,7 @@ struct Connection {
 struct SharedControl {
     volatile uint64_t ready_count;
     volatile uint64_t start_flag;
+    volatile uint64_t first_response_count;
     volatile int rc;
 };
 
@@ -117,6 +118,12 @@ static inline uint64_t
 m5_rpns_ns(void)
 {
     return m5_rpns();
+}
+
+static inline void
+cpu_relax(void)
+{
+    asm volatile("pause" : : : "memory");
 }
 
 static int
@@ -500,18 +507,42 @@ request_result_index(uint64_t client_id, uint64_t req_id, uint64_t request_count
 }
 
 static inline int
-client_is_slow(uint64_t client_id, uint64_t slow_client_count)
+client_is_selected_evenly(uint64_t client_id,
+                          uint64_t client_count,
+                          uint64_t selected_client_count)
 {
-    return client_id < slow_client_count;
+    if (selected_client_count == 0)
+        return 0;
+
+    if (selected_client_count >= client_count)
+        return 1;
+
+    for (uint64_t selected_index = 0;
+         selected_index < selected_client_count;
+         selected_index++) {
+        if ((selected_index * client_count) / selected_client_count == client_id)
+            return 1;
+    }
+
+    return 0;
+}
+
+static inline int
+client_is_slow(uint64_t client_id,
+               uint64_t client_count,
+               uint64_t slow_client_count)
+{
+    return client_is_selected_evenly(client_id, client_count, slow_client_count);
 }
 
 static inline uint64_t
 client_request_limit(uint64_t client_id,
+                     uint64_t client_count,
                      uint64_t request_count,
                      uint64_t slow_client_count,
                      uint64_t slow_request_count)
 {
-    if (client_is_slow(client_id, slow_client_count))
+    if (client_is_slow(client_id, client_count, slow_client_count))
         return slow_request_count;
 
     return request_count;
@@ -527,6 +558,7 @@ total_request_limit(uint64_t client_count,
 
     for (uint64_t client_id = 0; client_id < client_count; client_id++) {
         total += client_request_limit(client_id,
+                                      client_count,
                                       request_count,
                                       slow_client_count,
                                       slow_request_count);
@@ -565,6 +597,28 @@ send_is_due(enum SendMode send_mode,
     return m5_rpns_ns() >= deadline_ns;
 }
 
+static inline uint64_t
+scale_sparse_send_gap_ns(uint64_t base_send_gap_ns,
+                         uint64_t request_count,
+                         uint64_t client_request_count)
+{
+    uint64_t total_span_ns = 0;
+
+    if (base_send_gap_ns == 0 ||
+        request_count <= 1u ||
+        client_request_count <= 1u ||
+        client_request_count >= request_count) {
+        return base_send_gap_ns;
+    }
+
+    // Keep the sparse-client issue span aligned with the baseline
+    // request-count schedule. Fewer requests therefore implies a larger
+    // inter-send gap and a sparser request stream.
+    total_span_ns = (request_count - 1u) * base_send_gap_ns;
+    return (total_span_ns + (client_request_count - 2u)) /
+           (client_request_count - 1u);
+}
+
 static uint64_t
 next_rand(uint64_t *state)
 {
@@ -590,6 +644,19 @@ static int
 control_has_error(struct SharedControl *control)
 {
     return __atomic_load_n(&control->rc, __ATOMIC_RELAXED);
+}
+
+static int
+wait_for_first_round_completion(struct SharedControl *control,
+                                uint64_t participant_count)
+{
+    while (!control_has_error(control) &&
+           __atomic_load_n((const uint64_t *)&control->first_response_count,
+                           __ATOMIC_ACQUIRE) < participant_count) {
+        cpu_relax();
+    }
+
+    return control_has_error(control) ? -1 : 0;
 }
 
 static inline void
@@ -635,6 +702,7 @@ struct AppRuntime {
     double read_ratio;
     double update_ratio;
     double rmw_ratio;
+    double insert_ratio;
     hydrarpc_app_key_dist_t key_dist;
     double zipf_theta;
     int variable_layout;
@@ -685,6 +753,7 @@ init_app_runtime(struct AppRuntime *runtime,
                  double read_ratio,
                  double update_ratio,
                  double rmw_ratio,
+                 double insert_ratio,
                  hydrarpc_app_key_dist_t key_dist,
                  double zipf_theta,
                  uint64_t dataset_seed,
@@ -703,6 +772,7 @@ init_app_runtime(struct AppRuntime *runtime,
     runtime->read_ratio = read_ratio;
     runtime->update_ratio = update_ratio;
     runtime->rmw_ratio = rmw_ratio;
+    runtime->insert_ratio = insert_ratio;
     runtime->key_dist = key_dist;
     runtime->zipf_theta = zipf_theta;
     runtime->variable_layout = variable_layout;
@@ -730,6 +800,7 @@ init_app_runtime(struct AppRuntime *runtime,
 
     for (uint64_t client_id = 0; client_id < client_count; client_id++) {
         uint64_t client_request_count = client_request_limit(client_id,
+                                                             client_count,
                                                              request_count,
                                                              slow_client_count,
                                                              slow_request_count);
@@ -749,6 +820,8 @@ init_app_runtime(struct AppRuntime *runtime,
                 client_request_count,
                 profile->name,
                 record_count,
+                client_count,
+                request_count,
                 client_id,
                 key_size,
                 value_size,
@@ -756,6 +829,7 @@ init_app_runtime(struct AppRuntime *runtime,
                 read_ratio,
                 update_ratio,
                 rmw_ratio,
+                insert_ratio,
                 key_dist,
                 zipf_theta,
                 dataset_seed,
@@ -767,6 +841,10 @@ init_app_runtime(struct AppRuntime *runtime,
     if (hydrarpc_apprt_store_init(&runtime->store,
                                   profile->name,
                                   (size_t)record_count,
+                                  (size_t)(record_count -
+                                           hydrarpc_apprt_total_insert_count(
+                                               client_count * request_count,
+                                               insert_ratio)),
                                   key_size,
                                   value_size,
                                   runtime->max_key_size,
@@ -938,13 +1016,24 @@ fill_random_payload_remote_and_shadow(uint8_t *remote_dst,
         uint64_t chunk_len = min_u64(payload_len - offset, sizeof(word));
 
         memcpy(remote_dst + offset, &word, (size_t)chunk_len);
-        memcpy(shadow_dst + offset, &word, (size_t)chunk_len);
+        if (shadow_dst != NULL)
+            memcpy(shadow_dst + offset, &word, (size_t)chunk_len);
         offset += chunk_len;
     }
 
 #if !HYDRARPC_COHERENT
     flush_payload_remote_stores(remote_dst, payload_len);
 #endif
+}
+
+static void
+rebuild_random_payload_bytes(uint8_t *dst,
+                             uint64_t payload_len,
+                             uint64_t seed)
+{
+    uint64_t rng_state = seed;
+
+    fill_random_payload_bytes(dst, payload_len, &rng_state);
 }
 
 static void
@@ -1134,6 +1223,9 @@ build_client_request_payload(uint8_t *remote_dst,
                              uint64_t *rng_state,
                              enum TransferMode transfer_mode)
 {
+    if (transfer_mode == TRANSFER_STAGING && request_shadow == NULL)
+        return -1;
+
     store_request_payload(remote_dst,
                           request_shadow,
                           request_payload_size,
@@ -1259,6 +1351,7 @@ run_server_dedicated(struct Connection *connections,
             struct Connection *connection = &connections[client_id];
             uint64_t seq = next_seq[client_id];
             uint64_t client_request_count = client_request_limit(client_id,
+                                                                 client_count,
                                                                  request_count,
                                                                  slow_client_count,
                                                                  slow_request_count);
@@ -1276,8 +1369,22 @@ run_server_dedicated(struct Connection *connections,
             volatile struct NotifyQueueLine *request_queue_line = NULL;
             volatile struct NotifyQueueLine *response_queue_line = NULL;
 
-            if (seq >= client_request_count)
+            slot = seq % slot_count;
+            request_queue_line =
+                notify_queue_line_at(connection->request_queue, slot);
+            request_notify = load_notify_word_remote(request_queue_line);
+            if (!notify_valid(request_notify))
                 continue;
+
+            if (seq >= client_request_count) {
+                fprintf(stderr,
+                        "server observed unexpected request ordinal client=%" PRIu64
+                        " req=%" PRIu64 "\n",
+                        client_id,
+                        seq);
+                set_control_error(control);
+                break;
+            }
 
             expected_request_len =
 #if HYDRARPC_APP_VARIANT
@@ -1303,16 +1410,9 @@ run_server_dedicated(struct Connection *connections,
                                      seq,
                                      client_request_count);
 #endif
-
-            slot = seq % slot_count;
             index = request_result_index(client_id, seq, request_count);
-            request_queue_line =
-                notify_queue_line_at(connection->request_queue, slot);
             response_queue_line =
                 notify_queue_line_at(connection->response_queue, slot);
-            request_notify = load_notify_word_remote(request_queue_line);
-            if (!notify_valid(request_notify))
-                continue;
 
             if (!first_request_logged) {
                 tracef("server_first_request client=%" PRIu64 " seq=%" PRIu64
@@ -1437,6 +1537,7 @@ run_client_dedicated(struct Connection *connection,
 {
     size_t base = (size_t)(client_id * request_count);
     uint64_t client_request_count = client_request_limit(client_id,
+                                                         client_count,
                                                          request_count,
                                                          slow_client_count,
                                                          slow_request_count);
@@ -1453,11 +1554,22 @@ run_client_dedicated(struct Connection *connection,
         payload_length_plan_stride(request_length_plan);
     uint64_t response_payload_stride =
         payload_length_plan_stride(response_length_plan);
-    uint8_t *request_shadow_local = calloc((size_t)client_request_count,
-                                           (size_t)request_payload_stride);
+    uint8_t *request_shadow_local = NULL;
+    uint64_t *request_seed_local = NULL;
+    uint8_t *request_verify_local = NULL;
     uint8_t *response_local = malloc((size_t)response_payload_stride);
     int first_request_logged = 0;
     int first_response_logged = 0;
+    int first_response_counted = 0;
+
+    if (request_transfer_mode == TRANSFER_STAGING) {
+        request_shadow_local = calloc((size_t)client_request_count,
+                                      (size_t)request_payload_stride);
+    } else {
+        request_seed_local =
+            calloc((size_t)client_request_count, sizeof(*request_seed_local));
+        request_verify_local = malloc((size_t)request_payload_stride);
+    }
 
     tracef("client_enter client=%" PRIu64 " client_count=%" PRIu64
            " request_count=%" PRIu64 " slot_count=%" PRIu64
@@ -1468,11 +1580,17 @@ run_client_dedicated(struct Connection *connection,
            slot_count,
            transfer_mode_string(request_transfer_mode));
 
-    if (request_shadow_local == NULL || response_local == NULL) {
+    if (((request_transfer_mode == TRANSFER_STAGING &&
+          request_shadow_local == NULL) ||
+         (request_transfer_mode != TRANSFER_STAGING &&
+          (request_seed_local == NULL || request_verify_local == NULL))) ||
+        response_local == NULL) {
         fprintf(stderr, "client %" PRIu64 " local tracking allocation failed\n",
                 client_id);
         set_control_error(control);
         free(request_shadow_local);
+        free(request_seed_local);
+        free(request_verify_local);
         free(response_local);
         return 1;
     }
@@ -1483,13 +1601,18 @@ run_client_dedicated(struct Connection *connection,
                 client_id);
         set_control_error(control);
         free(request_shadow_local);
+        free(request_seed_local);
+        free(request_verify_local);
         free(response_local);
         return 1;
     }
 
-    if (client_is_slow(client_id, slow_client_count)) {
+    if (client_is_slow(client_id, client_count, slow_client_count)) {
         effective_send_mode = SEND_UNIFORM;
-        effective_send_gap_ns = slow_send_gap_ns;
+        effective_send_gap_ns =
+            scale_sparse_send_gap_ns(slow_send_gap_ns,
+                                     request_count,
+                                     client_request_count);
     }
 
     signal_ready_and_wait(control);
@@ -1497,6 +1620,15 @@ run_client_dedicated(struct Connection *connection,
     tracef("client_start client=%" PRIu64 " schedule_base_ns=%" PRIu64,
            client_id,
            send_schedule_base_ns);
+
+    if (client_request_count == 0) {
+        __atomic_fetch_add(&control->first_response_count, 1, __ATOMIC_RELEASE);
+        free(request_shadow_local);
+        free(request_seed_local);
+        free(request_verify_local);
+        free(response_local);
+        return control_has_error(control) ? 1 : 0;
+    }
 
     while (completed < client_request_count && !control_has_error(control)) {
         int made_progress = 0;
@@ -1536,10 +1668,15 @@ run_client_dedicated(struct Connection *connection,
                                         client_request_count);
 #endif
                 size_t index = base + sent;
-                uint8_t *request_shadow =
-                    request_shadow_at(request_shadow_local,
-                                      sent,
-                                      request_payload_stride);
+                uint8_t *request_shadow = NULL;
+
+                if (request_transfer_mode == TRANSFER_STAGING) {
+                    request_shadow = request_shadow_at(request_shadow_local,
+                                                      sent,
+                                                      request_payload_stride);
+                } else {
+                    request_seed_local[sent] = rng_state;
+                }
 
                 start = m5_rpns_ns();
                 if (!first_request_logged) {
@@ -1643,10 +1780,7 @@ run_client_dedicated(struct Connection *connection,
                                              completed,
                                              client_request_count);
 #endif
-                    uint8_t *request_shadow =
-                        request_shadow_at(request_shadow_local,
-                                          completed,
-                                          request_payload_stride);
+                    const uint8_t *expected_request_bytes = NULL;
                     uint64_t end = 0;
 
                     if (response_len != expected_response_len) {
@@ -1657,11 +1791,25 @@ run_client_dedicated(struct Connection *connection,
                     break;
                 }
 
-                load_payload_remote(
-                    response_local,
-                    payload_at_offset(connection->response_data_area,
-                                      response_offset),
-                    response_len
+                    if (request_transfer_mode == TRANSFER_STAGING) {
+                        expected_request_bytes =
+                            request_shadow_at(request_shadow_local,
+                                              completed,
+                                              request_payload_stride);
+                    } else {
+                        rebuild_random_payload_bytes(
+                            request_verify_local,
+                            expected_request_len,
+                            request_seed_local[completed]
+                        );
+                        expected_request_bytes = request_verify_local;
+                    }
+
+                    load_payload_remote(
+                        response_local,
+                        payload_at_offset(connection->response_data_area,
+                                          response_offset),
+                        response_len
                     );
                     if (
 #if HYDRARPC_APP_VARIANT
@@ -1670,14 +1818,14 @@ run_client_dedicated(struct Connection *connection,
                                                  completed,
                                                  response_local,
                                                  response_len,
-                                                 request_shadow,
+                                                 expected_request_bytes,
                                                  expected_request_len)
 #else
                         !client_response_matches(client_id,
                                                  completed,
                                                  response_local,
                                                  response_len,
-                                                 request_shadow,
+                                                 expected_request_bytes,
                                                  expected_request_len)
 #endif
                     ) {
@@ -1705,6 +1853,17 @@ run_client_dedicated(struct Connection *connection,
 
                 completed++;
                 made_progress = 1;
+
+                if (!first_response_counted && completed == 1u) {
+                    __atomic_fetch_add(&control->first_response_count,
+                                       1,
+                                       __ATOMIC_RELEASE);
+                    first_response_counted = 1;
+                    if (wait_for_first_round_completion(control,
+                                                        client_count) != 0) {
+                        break;
+                    }
+                }
             }
         }
 
@@ -1713,6 +1872,8 @@ run_client_dedicated(struct Connection *connection,
     }
 
     free(request_shadow_local);
+    free(request_seed_local);
+    free(request_verify_local);
     free(response_local);
     tracef("client_exit client=%" PRIu64 " sent=%" PRIu64
            " completed=%" PRIu64 " rc=%d",
@@ -1756,6 +1917,7 @@ write_results(FILE *stream,
             *timing->server_loop_start_ts_ns);
     for (uint64_t client_id = 0; client_id < client_count; client_id++) {
         uint64_t client_request_count = client_request_limit(client_id,
+                                                             client_count,
                                                              request_count,
                                                              slow_client_count,
                                                              slow_request_count);
@@ -1925,6 +2087,7 @@ main(int argc, char **argv)
     double app_read_ratio = 0.0;
     double app_update_ratio = 0.0;
     double app_rmw_ratio = 0.0;
+    double app_insert_ratio = 0.0;
     hydrarpc_app_key_dist_t app_key_dist = HYDRARPC_APP_KEY_DIST_ZIPF;
     double app_zipf_theta = 0.0;
     int app_key_size_overridden = 0;
@@ -1951,6 +2114,7 @@ main(int argc, char **argv)
     app_read_ratio = app_profile.read_ratio;
     app_update_ratio = app_profile.update_ratio;
     app_rmw_ratio = app_profile.rmw_ratio;
+    app_insert_ratio = app_profile.insert_ratio;
     app_key_dist = app_profile.key_dist;
     app_zipf_theta = app_profile.zipf_theta;
 #endif
@@ -2015,6 +2179,7 @@ main(int argc, char **argv)
             app_read_ratio = app_profile.read_ratio;
             app_update_ratio = app_profile.update_ratio;
             app_rmw_ratio = app_profile.rmw_ratio;
+            app_insert_ratio = app_profile.insert_ratio;
             app_key_dist = app_profile.key_dist;
             app_zipf_theta = app_profile.zipf_theta;
         } else if (strcmp(argv[i], "--record-count") == 0 && i + 1 < argc) {
@@ -2035,6 +2200,8 @@ main(int argc, char **argv)
             app_update_ratio = parse_double("update-ratio", argv[++i]);
         } else if (strcmp(argv[i], "--rmw-ratio") == 0 && i + 1 < argc) {
             app_rmw_ratio = parse_double("rmw-ratio", argv[++i]);
+        } else if (strcmp(argv[i], "--insert-ratio") == 0 && i + 1 < argc) {
+            app_insert_ratio = parse_double("insert-ratio", argv[++i]);
         } else if (strcmp(argv[i], "--zipf-theta") == 0 && i + 1 < argc) {
             app_zipf_theta = parse_double("zipf-theta", argv[++i]);
 #endif
@@ -2126,12 +2293,13 @@ main(int argc, char **argv)
         goto cleanup;
     }
     if (app_read_ratio < 0.0 || app_update_ratio < 0.0 ||
-        app_rmw_ratio < 0.0 ||
+        app_rmw_ratio < 0.0 || app_insert_ratio < 0.0 ||
         (app_key_dist == HYDRARPC_APP_KEY_DIST_ZIPF &&
          app_zipf_theta < 0.01) ||
-        fabs((app_read_ratio + app_update_ratio + app_rmw_ratio) - 1.0) > 1e-6) {
+        fabs((app_read_ratio + app_update_ratio + app_rmw_ratio +
+              app_insert_ratio) - 1.0) > 1e-6) {
         fprintf(stderr,
-                "read-ratio + update-ratio + rmw-ratio must equal 1.0 and zipf-theta must be >= 0.01 for zipf workloads\n");
+                "read-ratio + update-ratio + rmw-ratio + insert-ratio must equal 1.0 and zipf-theta must be >= 0.01 for zipf workloads\n");
         rc = 2;
         goto cleanup;
     }
@@ -2160,6 +2328,7 @@ main(int argc, char **argv)
                          app_read_ratio,
                          app_update_ratio,
                          app_rmw_ratio,
+                         app_insert_ratio,
                          app_key_dist,
                          app_zipf_theta,
                          app_dataset_seed,
@@ -2249,12 +2418,6 @@ main(int argc, char **argv)
     }
 
     if (slow_client_count > 0) {
-        if (slow_request_count == 0) {
-            fprintf(stderr,
-                    "slow-count-per-client must be positive when slow-client-count > 0\n");
-            rc = 2;
-            goto cleanup;
-        }
         if (slow_request_count > request_count) {
             fprintf(stderr,
                     "slow-count-per-client (%" PRIu64

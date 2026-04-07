@@ -11,7 +11,7 @@ Options:
   --count-per-client <N>   Requests per client. Default: 30
   --client-counts <list>   Quoted list, e.g. "32"
   --profiles <list>        Quoted list from the current supported set:
-                           "ycsb_a_1k ycsb_b_1k ycsb_c_1k ycsb_f_1k udb_ro"
+                           "ycsb_a_1k ycsb_b_1k ycsb_c_1k ycsb_d_1k udb_a udb_b udb_c udb_d"
   --kinds <list>           Quoted list from "dedicated shared". Default: both
   --window-size <N>        Max outstanding requests per client. Default: 16
   --slot-count <N>         Ring depth passed to both shared and dedicated. Default: 1024
@@ -41,7 +41,7 @@ EOF
 ROOT_OUTDIR=""
 COUNT_PER_CLIENT=30
 CLIENT_COUNTS="32"
-APP_PROFILES_DEFAULT="ycsb_a_1k ycsb_b_1k ycsb_c_1k ycsb_f_1k udb_ro"
+APP_PROFILES_DEFAULT="ycsb_a_1k ycsb_b_1k ycsb_c_1k ycsb_d_1k udb_a udb_b udb_c udb_d"
 PROFILES="$APP_PROFILES_DEFAULT"
 KINDS="dedicated shared"
 WINDOW_SIZE=16
